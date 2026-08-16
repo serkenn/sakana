@@ -73,7 +73,10 @@ for (const key of ['parliament_interval_hours', 'parliament_agenda_limit', 'parl
     '国会の量的な値は運営者の運用設定から変更できない');
 }
 assert.match(constitution, /定期的に開かれる国会/);
-assert.match(constitution, /投票の受付を開始した後に、条文または執行定義を変更してはならない/);
+assert.match(constitution, /成立判定を開始した後に、条文または執行定義を変更してはならない/);
+assert.match(constitution, /停止中の法律は執行できず、次の国会で維持または廃止を決める/,
+  'AI席で成立させる手続の制動を条文にも書く');
+assert.match(constitution, /保留期間中に同規則で定める数の構成員が異議を出したときは成立しない/);
 assert.match(constitution, /継続審議の回数は実行規則が定める上限を超えてはならず/);
 assert.equal(policyModule.validateAutomaticTrigger({
   type: 'message_burst', minimumMessages: 5, windowSeconds: 30
@@ -161,8 +164,48 @@ governanceDb.bootstrapGovernanceGuild({
 const storedConstitution = governanceDb.getActiveConstitution('g1');
 assert.equal(storedConstitution.source_format, 'embedded-rules-v1');
 assert.equal(storedConstitution.rules_hash, compiledConstitution.rulesHash);
-assert.equal(storedConstitution.rules.workflows.law.states.voting.duration, '12h');
+assert.equal(storedConstitution.rules.workflows.law.states.council.handler, 'council_decision');
 assert.equal(storedConstitution.rules.workflows.law.states.agenda.handler, 'parliament_agenda');
+
+// 記名投票の手続も同じschemaで書ける。投票機構はその憲法で確認する。
+function voteFlowRules() {
+  const rules = structuredClone(compiledConstitution.rules);
+  for (const key of ['law', 'constitutionalAmendment']) {
+    const workflow = rules.workflows[key];
+    delete workflow.states.council;
+    delete workflow.states.enactment_hold;
+    delete workflow.config.suspensionRequired;
+    workflow.states.voting = {
+      handler: 'public_vote',
+      duration: rules.votes[key].duration,
+      config: { vote: key },
+      on: { passed: 'enacted', rejected: 'rejected', stale: 'rejected' }
+    };
+    workflow.states.agenda.on.adopted = 'voting';
+  }
+  delete rules.panels.council;
+  return rules;
+}
+governanceDb.bootstrapGovernanceGuild({
+  guildId: 'gv',
+  enactedBy: 'owner',
+  trustedRoleId: 'trusted-role-v',
+  appealRoleId: 'appeal-role-v',
+  legislatureRoleId: 'legislature-role-v',
+  judiciaryRoleId: 'judiciary-role-v',
+  categoryId: 'category-v',
+  parliamentForumId: 'parliament-v',
+  courtForumId: 'court-v',
+  courtChatChannelId: 'court-chat-v',
+  procedureChannelId: 'procedure-v',
+  enforcementMode: 'shadow',
+  constitution: `${constitution}\n\n\`\`\`governance-rules\n${JSON.stringify(voteFlowRules())}\n\`\`\`\n`
+    .replace(/\`\`\`governance-rules\n\{[^\n]*\n\`\`\`\n\n/, ''),
+  policy
+});
+const voteConstitution = governanceDb.getActiveConstitution('gv');
+assert.equal(voteConstitution.rules.workflows.law.states.voting.handler, 'public_vote');
+assert.equal(voteConstitution.rules.workflows.law.states.council, undefined);
 
 const activityBase = Date.now();
 for (const [index, [id, hash]] of [['m1', 'same'], ['m2', 'same'], ['m3', 'different']].entries()) {
@@ -361,7 +404,7 @@ let proposal = governanceDb.createProposal({
   title: 'test',
   summary: 'test',
   proposerId: 'u1',
-  constitutionId: activeConstitution.id,
+  constitutionId: voteConstitution.id,
   status: 'agenda'
 });
 const proposalWorkflow = governanceDb.getWorkflowInstance('proposal', proposal.id);
@@ -1577,7 +1620,7 @@ assert.equal(procedureHub.components.length, 2);
 assert.equal(procedureHub.components[1].components[0].data.label, '自分が受けた処分を確認');
 let uxVoteProposal = governanceDb.createProposal({
   guildId: 'g1', kind: 'law', source: 'petition', title: '手続カードで投票する法案',
-  summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: uxConstitution.id,
+  summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: voteConstitution.id,
   status: 'voting', voteScope: 'all', stageEndsAt: Date.now() + 86_400_000
 });
 uxVoteProposal = governanceDb.updateProposal(uxVoteProposal.id, { forum_thread_id: 'vote-thread' });

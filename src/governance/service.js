@@ -1,6 +1,8 @@
 import { PermissionFlagsBits } from 'discord.js';
 import { db as archiveDb } from '../archive/db.js';
 import {
+  listBrakeRequests,
+  recordBrakeRequest,
   activateRestriction,
   addCaseEvidence,
   addCaseSubmission,
@@ -83,6 +85,7 @@ import {
   postAuthorityChange,
   postCourtUpdate,
   postCourtRecord,
+  enactmentHoldButtons,
   postProposalUpdate,
   publicMemberLabel,
   releaseAppealRestriction,
@@ -92,6 +95,7 @@ import {
   syncGovernanceRecordUi
 } from './discord.js';
 import {
+  decideEnactment,
   runConstitutionalPanel,
   runJudicialPanel
 } from './llm.js';
@@ -414,11 +418,182 @@ export async function openProposalVote(guild, proposal, outcome = 'adopted') {
   });
 }
 
+/**
+ * 成立判定。実行規則のpanelが定める席と必要票だけで決まり、記名投票は使わない。
+ * 席ごとの理由は案件へ公開し、監査記録にも残す。
+ */
+export async function councilDecideProposal(guild, proposal, outcome = 'adopted') {
+  const transition = proposalTransition(proposal, outcome);
+  if (transition.target.handler !== 'council_decision') throw new Error('成立判定へ遷移できない案件です。');
+  const deciding = updateProposal(proposal.id, {
+    status: transition.targetName,
+    stage_started_at: Date.now(),
+    stage_ends_at: null,
+    retry_after: null,
+    failure_count: 0,
+    last_error: null
+  });
+  const runtime = proposalRuntime(deciding);
+  const panel = runtime.compiled.rules.panels[runtime.state.config.panel];
+  const { outputs } = await decideEnactment({
+    guildId: guild.id,
+    proposal: deciding,
+    agenda: deciding.workflow_context?.agenda ?? null,
+    constitution: runtime.constitution,
+    activeLaws: listLaws(guild.id, { activeOnly: true, limit: 200 }),
+    seats: panel.seats
+  });
+  const enact = outputs.filter((output) => output.verdict === 'enact').length;
+  const passed = enact >= panel.required.enact;
+  await postProposalUpdate(guild, deciding, [
+    `## 国会の成立判定`,
+    `賛成 ${enact}/${panel.seats}席 (必要 ${panel.required.enact}席)`,
+    passed ? '成立させます。' : '成立させません。'
+  ].join('\n'), {
+    state: passed ? '投票' : '否決',
+    files: [{
+      attachment: Buffer.from(`${JSON.stringify({ seats: panel.seats, required: panel.required.enact, outputs }, null, 2)}\n`),
+      name: '成立判定.json'
+    }]
+  });
+  writeAudit({
+    guildId: guild.id, actorType: 'system', actorId: 'council', action: 'proposal.council_decision',
+    targetType: 'proposal', targetId: deciding.id,
+    detail: { enact, seats: panel.seats, required: panel.required.enact, passed, public: true }
+  });
+  if (!passed) {
+    const rejectTransition = proposalTransition(deciding, 'rejected');
+    const rejected = updateProposal(deciding.id, { status: rejectTransition.targetName, stage_ends_at: Date.now() });
+    await postProposalUpdate(guild, rejected, '必要票に達しなかったため、この案は成立しませんでした。', { state: '否決' });
+    return rejected;
+  }
+  const passTransition = proposalTransition(deciding, 'passed');
+  if (passTransition.target.handler === 'enactment_hold') return openEnactmentHold(guild, deciding, passTransition);
+  return enactPassedProposal(guild, deciding, 'council');
+}
+
+/**
+ * 憲法改正の保留期間。施行済みの憲法は、それを根拠に成立した法律や判決との
+ * 整合を壊さずに巻き戻せない。だから憲法だけは施行の前に止められるようにする。
+ */
+async function openEnactmentHold(guild, proposal, transition) {
+  const now = Date.now();
+  const stageEndsAt = proposalStageEnd(transition, now);
+  const holding = updateProposal(proposal.id, {
+    status: transition.targetName,
+    stage_started_at: now,
+    stage_ends_at: stageEndsAt,
+    retry_after: null,
+    failure_count: 0,
+    last_error: null
+  });
+  await postProposalUpdate(guild, holding, [
+    '国会はこの改憲案を可決しました。施行の前に保留期間を置きます。',
+    `期限までに${transition.target.config.required}人が下のボタンから異議を出すと、この改正は成立しません。`,
+    `期限: <t:${Math.floor(stageEndsAt / 1000)}:F>`
+  ].join('\n'), { state: '投票', components: enactmentHoldButtons(proposal.id) });
+  return holding;
+}
+
+export async function fileEnactmentObjection(guild, actor, proposalId, reason) {
+  const proposal = getProposal(proposalId);
+  if (!proposal || proposal.guild_id !== guild.id) throw new Error('案件が見つかりません。');
+  const runtime = proposalRuntime(proposal);
+  if (runtime?.state?.handler !== 'enactment_hold') throw new Error('この案件は保留期間ではありません。');
+  if (Number(proposal.stage_ends_at ?? 0) <= Date.now()) throw new Error('保留期間は終わっています。');
+  if (!governanceActionAllowed(guild.id, actor.id, 'vote')) throw new Error('異議の提出が制裁により停止されています。');
+  const text = String(reason ?? '').trim();
+  if (!text) throw new Error('理由を書いてください。');
+  const required = Number(runtime.state.config.required);
+  const objections = recordBrakeRequest({
+    guildId: guild.id, targetType: 'proposal', targetId: proposal.id, userId: actor.id, reason: text.slice(0, 1_000)
+  });
+  writeAudit({
+    guildId: guild.id, actorType: 'member', actorId: actor.id, action: 'proposal.enactment_objection',
+    targetType: 'proposal', targetId: proposal.id, detail: { count: objections.length, required, public: true }
+  });
+  if (objections.length < required) {
+    await postProposalUpdate(
+      guild,
+      proposal,
+      `${publicMemberLabel(actor.id)} が成立に異議を出しました（${objections.length}/${required}人）。\n**理由**\n${text.slice(0, 1_000)}`,
+      { state: '投票', components: enactmentHoldButtons(proposal.id) }
+    );
+    return { proposal, objections, required, vetoed: false };
+  }
+  const transition = proposalTransition(proposal, 'vetoed');
+  const vetoed = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
+  await postProposalUpdate(guild, vetoed, `保留期間中に${objections.length}人の異議がそろったため、この改正は成立しませんでした。`, {
+    state: '否決', components: []
+  });
+  return { proposal: vetoed, objections, required, vetoed: true };
+}
+
+async function closeEnactmentHold(guild, proposal, now) {
+  const runtime = proposalRuntime(proposal);
+  const required = Number(runtime.state.config.required);
+  const objections = listBrakeRequests('proposal', proposal.id);
+  if (objections.length >= required) {
+    const transition = proposalTransition(proposal, 'vetoed');
+    const vetoed = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: now });
+    await postProposalUpdate(guild, vetoed, `保留期間中の異議が${objections.length}人に達したため、この改正は成立しませんでした。`, {
+      state: '否決', components: []
+    });
+    return vetoed;
+  }
+  await postProposalUpdate(
+    guild,
+    proposal,
+    objections.length === 0
+      ? '保留期間に異議がなかったため、この改正を施行します。'
+      : `保留期間の異議は${objections.length}人で、必要な${required}人に届かなかったため、この改正を施行します。`,
+    { state: '投票', components: [] }
+  );
+  return enactPassedProposal(guild, proposal, 'council', 'expired');
+}
+
+/**
+ * 施行後の停止。AI席だけで成立させる手続で、人間が持つ唯一の制動。必要数に達したら
+ * その法律を直ちに止め、次の国会で維持か廃止を決める。
+ */
+export async function fileLawSuspension(guild, actor, lawId, reason) {
+  const { constitution } = requireGovernance(guild.id);
+  const law = getCurrentLawVersion(lawId) ?? getLaw(lawId);
+  if (!law || law.guild_id !== guild.id) throw new Error('法律が見つかりません。');
+  if (law.status !== 'active') throw new Error('この法律は現行ではありません。');
+  if (!governanceActionAllowed(guild.id, actor.id, 'vote')) throw new Error('停止の請求が制裁により停止されています。');
+  const text = String(reason ?? '').trim();
+  if (!text) throw new Error('理由を書いてください。');
+  const required = lawSuspensionRequirement(constitution);
+  if (!required) throw new Error('この憲法は施行後の停止を定めていません。');
+  const requests = recordBrakeRequest({
+    guildId: guild.id, targetType: 'law', targetId: law.id, userId: actor.id, reason: text.slice(0, 1_000)
+  });
+  writeAudit({
+    guildId: guild.id, actorType: 'member', actorId: actor.id, action: 'law.suspension_request',
+    targetType: 'law', targetId: law.id, detail: { count: requests.length, required, public: true }
+  });
+  if (requests.length < required) return { law, requests, required, suspended: false };
+  const suspended = updateLaw(law.id, { status: 'suspended' });
+  try {
+    syncLawSite(guild);
+  } catch (error) {
+    console.error(`Failed to queue suspension of law ${law.id} for the public law site:`, error);
+  }
+  return { law: suspended, requests, required, suspended: true };
+}
+
+export function lawSuspensionRequirement(constitution) {
+  const rules = constitution?.rules
+    ?? compileConstitution({ content: constitution.content, policy: constitution.policy }).rules;
+  const value = rules?.workflows?.law?.config?.suspensionRequired;
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
 async function closeProposalVote(guild, proposal) {
   const { governance } = requireGovernance(guild.id);
   const runtime = proposalRuntime(proposal);
   if (runtime?.state?.handler !== 'public_vote') throw new Error('この案件は投票中ではありません。');
-  const constitution = runtime.constitution;
   const summary = proposalVoteSummary(proposal.id);
   const result = closeGovernanceVote(
     { kind: proposal.kind, scope: proposal.vote_scope, ...summary },
@@ -431,11 +606,20 @@ async function closeProposalVote(guild, proposal) {
     await postProposalUpdate(guild, proposal, `否決されました。賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / 定足数 ${summary.yes + summary.no + summary.abstain}/${result.quorumNeeded} / ${electorate}の反対 ${summary.trustedNo}/${summary.trustedTotal}有効票 (棄権 ${summary.trustedAbstain} / 有権者 ${summary.trustedElectorate})`, { state: '否決' });
     return proposal;
   }
+  return enactPassedProposal(guild, proposal, 'vote');
+}
+
+/**
+ * 成立が決まった案件を施行する。記名投票でもAI席の判定でも、ここから先は同じ。
+ */
+async function enactPassedProposal(guild, proposal, enactedBy, outcome = 'passed') {
+  const runtime = proposalRuntime(proposal);
+  const constitution = runtime.constitution;
   if (proposal.kind === 'amendment') {
     const active = getActiveConstitution(guild.id);
     if (!proposal.target_hash || Number(proposal.target_id) !== Number(active?.id)
       || proposal.target_hash !== active?.content_hash) {
-      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected;
+      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected ?? runtime.state.on.vetoed;
       proposal = updateProposal(proposal.id, { status: staleTarget, stage_ends_at: Date.now() });
       await postProposalUpdate(guild, proposal, '審議中に現行憲法が更新されたため、この案は成立させず差し戻しました。最新版を基礎に再提出してください。', { state: '廃案' });
       return proposal;
@@ -445,11 +629,11 @@ async function closeProposalVote(guild, proposal) {
       content: proposal.body.content,
       policy: proposal.body.policy,
       proposalId: proposal.id,
-      enactedBy: 'vote',
+      enactedBy,
       targetConstitutionId: proposal.target_id,
       targetHash: proposal.target_hash
     });
-    const transition = proposalTransition(proposal, 'passed');
+    const transition = proposalTransition(proposal, outcome);
     proposal = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
     await postProposalUpdate(guild, proposal, `改憲が成立しました。憲法 v${next.version} が有効です。`, { state: '成立' });
     try {
@@ -477,7 +661,7 @@ async function closeProposalVote(guild, proposal) {
   if (proposal.target_type === 'law') {
     const currentTarget = getCurrentLawVersion(proposal.target_id);
     if (!currentTarget || currentTarget.content_hash !== proposal.target_hash) {
-      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected;
+      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected ?? runtime.state.on.vetoed;
       proposal = updateProposal(proposal.id, { status: staleTarget, stage_ends_at: Date.now() });
       await postProposalUpdate(guild, proposal, '審議中に改正対象の法律が更新されたため、この案は成立させず差し戻しました。最新版を基礎に再提出してください。', { state: '廃案' });
       return proposal;
@@ -495,7 +679,7 @@ async function closeProposalVote(guild, proposal) {
     targetHash: proposal.target_hash,
     effectiveAt: Date.now()
   });
-  const transition = proposalTransition(proposal, 'passed');
+  const transition = proposalTransition(proposal, outcome);
   proposal = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
   await postProposalUpdate(guild, proposal, proposal.target_type === 'law'
     ? `可決・成立しました。「${law.title}」v${law.version} が有効です。旧版は履歴として保存します。`
@@ -1639,6 +1823,10 @@ async function ensureAppealRestriction(guild, sanctionId) {
 export async function advanceProposal(guild, proposal, now) {
   if (proposal.retry_after && proposal.retry_after > now) return proposal;
   const runtime = proposalRuntime(proposal);
+  if (runtime?.state?.handler === 'enactment_hold') {
+    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) return proposal;
+    return closeEnactmentHold(guild, proposal, now);
+  }
   if (!runtime || runtime.state.handler !== 'public_vote') return proposal;
   if (proposal.stage_ends_at !== null && Number(proposal.stage_ends_at) <= now) {
     return closeProposalVote(guild, proposal);

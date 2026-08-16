@@ -1050,6 +1050,22 @@ db.exec(`
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (20, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_brake_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (target_type, target_id, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_brake_requests
+    ON governance_brake_requests(guild_id, target_type, target_id, id);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (21, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -2452,6 +2468,28 @@ export function updateLaw(id, patch) {
   db.prepare(`UPDATE governance_laws SET ${sql} WHERE id = @id`)
     .run({ id: Number(id), ...Object.fromEntries(entries) });
   return getLaw(id);
+}
+
+/**
+ * 人間が止めるための請求。AI席だけで成立させる手続では、施行後の法律の停止と
+ * 施行前の改憲の保留がこれで動く。1つの対象につき1人1件で、数え直せる形に残す。
+ */
+export function recordBrakeRequest({ guildId, targetType, targetId, userId, reason }) {
+  db.prepare(`
+    INSERT INTO governance_brake_requests (guild_id, target_type, target_id, user_id, reason, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(target_type, target_id, user_id)
+      DO UPDATE SET reason = excluded.reason, created_at = excluded.created_at
+  `).run(String(guildId), String(targetType), Number(targetId), String(userId), String(reason), Date.now());
+  return listBrakeRequests(targetType, targetId);
+}
+
+export function listBrakeRequests(targetType, targetId) {
+  return db.prepare(`
+    SELECT * FROM governance_brake_requests
+    WHERE target_type = ? AND target_id = ?
+    ORDER BY id
+  `).all(String(targetType), Number(targetId));
 }
 
 export function listLaws(guildId, { activeOnly = true, limit = 50 } = {}) {

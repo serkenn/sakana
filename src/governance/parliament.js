@@ -30,13 +30,21 @@ import {
 import { sha256 } from './policy.js';
 import { buildLegislativeCandidates, exactActiveProposalMatch } from './relation.js';
 import { compileConstitution, governanceRulesSummary } from './rules.js';
-import { openProposalVote, publicPanelOutputs, retryPatch } from './service.js';
+import { councilDecideProposal, openProposalVote, publicPanelOutputs, retryPatch } from './service.js';
 
 const AGENDA_DISCUSSION_LIMIT = 300;
 const SCAN_WINDOW_MS = 7 * 86_400_000;
 
 function constitutionRules(constitution) {
   return constitution.rules ?? compileConstitution({ content: constitution.content }).rules;
+}
+
+function agendaAdoptedState(constitution, key = 'law') {
+  const rules = constitutionRules(constitution);
+  const workflow = rules?.workflows?.[key];
+  const agenda = workflow?.states?.[workflow.initial];
+  const target = agenda?.on?.adopted;
+  return target ? workflow.states[target] : null;
 }
 
 function agendaStateName(rules, key = 'law') {
@@ -342,6 +350,18 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
       }
     ]
   });
+  // 成立を記名投票で決めるか、AI席の必要票で決めるかは実行規則が持つ。
+  const adopted = agendaAdoptedState(constitution, current.kind === 'amendment' ? 'constitutionalAmendment' : 'law');
+  if (adopted?.handler === 'council_decision') {
+    const decided = await councilDecideProposal(guild, getProposal(current.id));
+    return {
+      proposalId: current.id,
+      title: current.title,
+      decision: 'legislate',
+      kind: current.kind,
+      enactment: decided.status
+    };
+  }
   const voting = await openProposalVote(guild, getProposal(current.id));
   return {
     proposalId: current.id,

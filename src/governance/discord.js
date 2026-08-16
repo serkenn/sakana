@@ -37,11 +37,15 @@ function proposalStateLabel(state, handler = null) {
   return ({
     agenda: '議題',
     voting: '投票中',
+    council: '投票中',
+    enactment_hold: '投票中',
     enacted: '成立',
     rejected: '不成立'
   })[state] ?? ({
     parliament_agenda: '議題',
     public_vote: '投票中',
+    council_decision: '投票中',
+    enactment_hold: '投票中',
     terminal: '不成立'
   })[handler] ?? '議題';
 }
@@ -617,6 +621,18 @@ export async function setForumState(thread, name) {
   await thread.setAppliedTags([id], `Community governance state: ${name}`);
 }
 
+export function enactmentHoldButtons(proposalId, disabled = false) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:hold:${proposalId}:object`).setLabel('この改正に異議').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+  )];
+}
+
+export function lawSuspensionButtons(lawId, disabled = false) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:suspend:${lawId}:request`).setLabel('この法律の停止を求める').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+  )];
+}
+
 export function voteButtons(proposalId, disabled = false) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gov:vote:${proposalId}:yes`).setLabel('賛成').setStyle(ButtonStyle.Success).setDisabled(disabled),
@@ -655,6 +671,8 @@ function proposalNextAction(proposal) {
   const byStatus = ({
     agenda: 'この投稿で討論できます。次の国会が読みます。',
     voting: '「手続」の案件カードから投票できます。',
+    council: '国会の席が成立を判定しています。',
+    enactment_hold: '可決済みです。施行前の保留期間で、必要数の異議があれば成立しません。',
     enacted: '成立しました。現行本文は法令集にあります。',
     rejected: '成立しませんでした。'
   })[proposal.status];
@@ -662,6 +680,8 @@ function proposalNextAction(proposal) {
   return ({
     parliament_agenda: 'この投稿で討論できます。次の国会が読みます。',
     public_vote: '「手続」の案件カードから投票できます。',
+    council_decision: '国会の席が成立を判定しています。',
+    enactment_hold: '可決済みです。施行前の保留期間で、必要数の異議があれば成立しません。',
     terminal: '結論が確定しました。'
   })[proposalHandler(proposal)] ?? 'この投稿で経過を確認できます。';
 }

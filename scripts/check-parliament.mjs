@@ -25,18 +25,38 @@ assert.equal(compiled.rules.workflows.law.states.agenda.handler, 'parliament_age
 assert.equal(compiled.rules.workflows.law.states.agenda.on.deferred, 'agenda');
 assert.equal(compiled.rules.parliament.maximumDeferrals, 3);
 assert.equal(compiled.rules.parliament.sessionInterval, '72h');
-assert.deepEqual(compiled.rules.workflows.law.config, {},
-  '国会の量的な値はworkflowではなくparliamentセクションが持つ');
+assert.deepEqual(compiled.rules.workflows.law.config, { suspensionRequired: 2 },
+  '国会の量的な値はparliamentセクションが持ち、workflowが持つのは制動の必要数だけ');
+assert.equal(compiled.rules.workflows.law.states.agenda.on.adopted, 'council');
+assert.equal(compiled.rules.workflows.law.states.council.handler, 'council_decision');
+assert.equal(compiled.rules.panels.council.required.enact, 2);
 
 // --- 実行規則の安全弁 ------------------------------------------------------
 const injected = structuredClone(compiled.rules);
 injected.workflows.law.states.agenda.handler = 'eval_user_text';
 assert.throws(() => rules.validateGovernanceRules(injected), /未対応のworkflow handler/);
 
-const skipVote = structuredClone(compiled.rules);
-skipVote.workflows.law.states.agenda.on.adopted = 'enacted';
-assert.throws(() => rules.validateGovernanceRules(skipVote), /public_vote へ進む必要があります|到達不能状態/,
-  '国会は投票を飛ばして成立させられない');
+const skipDecision = structuredClone(compiled.rules);
+skipDecision.workflows.law.states.agenda.on.adopted = 'enacted';
+assert.throws(() => rules.validateGovernanceRules(skipDecision), /public_vote へ進む必要があります|到達不能状態/,
+  '国会は成立判定を飛ばして成立させられない');
+
+// AI席で成立させる手続は、人間が止める手段を必ず持つ。
+const noSuspension = structuredClone(compiled.rules);
+delete noSuspension.workflows.law.config.suspensionRequired;
+assert.throws(() => rules.validateGovernanceRules(noSuspension), /suspensionRequired/,
+  '施行後に停止できない法律の手続は成立させられない');
+const noHold = structuredClone(compiled.rules);
+noHold.workflows.constitutionalAmendment.states.council.on.passed = 'enacted';
+assert.throws(() => rules.validateGovernanceRules(noHold), /enactment_hold|到達不能状態/,
+  '施行前に止められない改憲の手続は成立させられない');
+const zeroHold = structuredClone(compiled.rules);
+zeroHold.workflows.constitutionalAmendment.states.enactment_hold.config.required = 0;
+assert.throws(() => rules.validateGovernanceRules(zeroHold), /required が不正です/);
+const strayCouncilPanel = structuredClone(compiled.rules);
+strayCouncilPanel.workflows.law.states.council.config.panel = 'police';
+assert.throws(() => rules.validateGovernanceRules(strayCouncilPanel), /panelがありません/,
+  '成立判定は必要票を持つpanelしか指せない');
 
 const extraOutcome = structuredClone(compiled.rules);
 extraOutcome.workflows.law.states.agenda.on.enact = 'enacted';
@@ -44,7 +64,7 @@ assert.throws(() => rules.validateGovernanceRules(extraOutcome), /未対応の�
   '議題から任意の遷移を足せない');
 
 const looseDeferral = structuredClone(compiled.rules);
-looseDeferral.workflows.law.states.agenda.on.deferred = 'voting';
+looseDeferral.workflows.law.states.agenda.on.deferred = 'council';
 assert.throws(() => rules.validateGovernanceRules(looseDeferral), /継続審議は同じ議題へ戻る/);
 
 // --- テスト用サーバー -------------------------------------------------------
@@ -159,6 +179,7 @@ const drafted = {
 let constitutionalVerdict = 'constitutional';
 const lawPushes = [];
 
+let enactmentVerdict = 'enact';
 globalThis.fetch = async (url, init) => {
   const target = String(url);
   if (target.startsWith('https://laws.example.test')) {
@@ -207,6 +228,8 @@ globalThis.fetch = async (url, init) => {
       reasons: ['公共の福祉の範囲に収まる。'],
       constitutionArticles: ['第四条（公共の福祉）']
     };
+  } else if (system.includes('Decide whether this drafted text should become binding now')) {
+    output = { verdict: enactmentVerdict, reasons: ['執行できる範囲に収まっている。'] };
   } else {
     throw new Error(`unexpected governance call: ${system.slice(0, 80)}`);
   }
@@ -265,28 +288,95 @@ session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Dat
 let bill = db.getProposalByForumThread(secondThread.id);
 assert.equal(session.outcomes.find((entry) => entry.proposalId === bill.id).decision, 'legislate');
 bill = db.getProposal(bill.id);
-assert.equal(bill.status, 'voting', '立法を選んだ議題は投票へ進む');
+assert.equal(bill.status, 'enacted', '立法を選んだ議題はAI席の必要票で成立する');
 assert.equal(bill.title, drafted.title);
 assert.ok(bill.body?.provisions?.offenses?.length === 1);
-assert.equal(db.proposalElectorate(bill.id).length, 2, '受付時に有権者を固定する');
-assert.ok(posts.some((post) => String(post.content).includes('投票を開始しました')));
-
-for (const userId of ['voter-1', 'voter-2']) {
-  await castAndPublishVote({
-    guildId: GUILD_ID,
-    guild,
-    user: { id: userId },
-    member: { id: userId }
-  }, bill.id, 'yes');
-}
-bill = db.getProposal(bill.id);
-await advanceProposal(guild, bill, Date.now());
-bill = db.getProposal(bill.id);
-assert.equal(bill.status, 'enacted', '全員投票で締切前に開票して成立する');
+assert.ok(posts.some((post) => String(post.content).includes('国会の成立判定')));
+assert.ok(posts.some((post) => String(post.content).includes('賛成 3/3席')));
+assert.equal(
+  db.listAudit(GUILD_ID, 50).some((entry) => entry.action === 'proposal.council_decision'),
+  true,
+  '成立判定を監査記録に残す'
+);
 const laws = db.listLaws(GUILD_ID);
 assert.equal(laws.length, 1);
 assert.equal(laws[0].title, drafted.title);
 assert.equal(threads.get(secondThread.id).archived, true);
+
+// --- 施行後の停止: AI席で成立させる手続で人間が持つ制動 ---------------------
+const { fileLawSuspension, fileEnactmentObjection } = await import('../src/governance/service.js');
+const enactedLaw = db.listLaws(GUILD_ID)[0];
+const firstRequest = await fileLawSuspension(guild, { id: 'voter-1' }, enactedLaw.id, '範囲が広すぎる');
+assert.equal(firstRequest.required, 2);
+assert.equal(firstRequest.suspended, false, '1人の請求では止めない');
+assert.equal(db.getLaw(enactedLaw.id).status, 'active');
+const repeated = await fileLawSuspension(guild, { id: 'voter-1' }, enactedLaw.id, '書き直し');
+assert.equal(repeated.requests.length, 1, '同じ人が何度出しても1件のまま');
+const secondRequest = await fileLawSuspension(guild, { id: 'voter-2' }, enactedLaw.id, '定義が曖昧');
+assert.equal(secondRequest.suspended, true);
+assert.equal(db.getLaw(enactedLaw.id).status, 'suspended', '必要数に達した時点で法律を止める');
+await assert.rejects(
+  () => fileLawSuspension(guild, { id: 'voter-3' }, enactedLaw.id, '追加'),
+  /現行ではありません/,
+  '停止済みの法律に重ねて請求させない'
+);
+db.updateLaw(enactedLaw.id, { status: 'active' });
+
+// --- 改憲の保留: 可決しても施行前に人間が止められる -------------------------
+const activeConstitution = db.getActiveConstitution(GUILD_ID);
+const holdProposal = db.updateProposal(db.createProposal({
+  guildId: GUILD_ID, kind: 'amendment', source: 'parliament', title: '保留テスト改憲案',
+  summary: '施行前の保留を確認する。', proposerId: 'bot',
+  constitutionId: activeConstitution.id,
+  body: {
+    title: '保留テスト改憲案',
+    summary: '施行前の保留を確認する。',
+    content: `${activeConstitution.content}\n\n<!-- 保留テスト -->\n`,
+    policy: null
+  },
+  status: agendaState,
+  targetType: 'constitution',
+  targetId: activeConstitution.id,
+  targetHash: activeConstitution.content_hash
+}).id, { forum_thread_id: secondThread.id });
+const held = await advanceProposal(guild, db.getProposal(holdProposal.id), Date.now());
+assert.equal(held.status, agendaState, 'schedulerは議題を勝手に進めない');
+const { councilDecideProposal } = await import('../src/governance/service.js');
+const heldAmendment = await councilDecideProposal(guild, db.getProposal(holdProposal.id), 'adopted');
+assert.equal(heldAmendment.status, 'enactment_hold', '可決した改憲は施行の前に保留期間へ入る');
+assert.equal(db.getActiveConstitution(GUILD_ID).id, activeConstitution.id, '保留中は憲法を差し替えない');
+const firstVeto = await fileEnactmentObjection(guild, { id: 'voter-1' }, heldAmendment.id, '権利が狭まる');
+assert.equal(firstVeto.vetoed, false, '1人の異議では止まらない');
+const secondVeto = await fileEnactmentObjection(guild, { id: 'voter-2' }, heldAmendment.id, '説明が足りない');
+assert.equal(secondVeto.vetoed, true);
+assert.equal(db.getProposal(heldAmendment.id).status, 'rejected', '必要数の異議は可決を止める');
+assert.equal(db.getActiveConstitution(GUILD_ID).id, activeConstitution.id);
+
+const quietHold = db.updateProposal(db.createProposal({
+  guildId: GUILD_ID, kind: 'amendment', source: 'parliament', title: '保留満了テスト改憲案',
+  summary: '異議がなければ施行する。', proposerId: 'bot',
+  constitutionId: activeConstitution.id,
+  body: {
+    title: '保留満了テスト改憲案',
+    summary: '異議がなければ施行する。',
+    content: `${activeConstitution.content}\n\n<!-- 保留満了テスト -->\n`,
+    policy: null
+  },
+  status: agendaState,
+  targetType: 'constitution',
+  targetId: activeConstitution.id,
+  targetHash: activeConstitution.content_hash
+}).id, { forum_thread_id: secondThread.id });
+const holding = await councilDecideProposal(guild, db.getProposal(quietHold.id), 'adopted');
+assert.equal(holding.status, 'enactment_hold');
+const enactedAmendment = await advanceProposal(
+  guild,
+  db.updateProposal(holding.id, { stage_ends_at: Date.now() - 1_000 }),
+  Date.now()
+);
+assert.equal(enactedAmendment.status, 'enacted');
+assert.equal(db.getActiveConstitution(GUILD_ID).version, activeConstitution.version + 1,
+  '保留期間に異議がなければ施行する');
 
 // --- 法令サイトへの押し込み -------------------------------------------------
 await processGovernanceOutbox({ guilds: { cache: new Map(), fetch: async () => guild } });

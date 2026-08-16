@@ -216,7 +216,7 @@ function deadline(value, prefix = '締切') {
   return value ? ` / ${prefix} <t:${Math.floor(Number(value) / 1000)}:R>` : '';
 }
 
-function procedureComponents(governance, supportsImmediateReview) {
+function procedureComponents(governance, supportsImmediateReview, supportsSuspension) {
   const link = (label, channelId) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link)
     .setURL(`https://discord.com/channels/${governance.guild_id}/${channelId}`);
   const lawSite = lawSiteLink(governance.guild_id);
@@ -228,9 +228,14 @@ function procedureComponents(governance, supportsImmediateReview) {
   ].filter(Boolean);
   return [
     new ActionRowBuilder().addComponents(...destinations),
-    supportsImmediateReview ? new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gov:contest_list:0').setLabel('自分が受けた処分を確認').setStyle(ButtonStyle.Primary)
-    ) : null
+    supportsImmediateReview || supportsSuspension ? new ActionRowBuilder().addComponents(...[
+      supportsImmediateReview
+        ? new ButtonBuilder().setCustomId('gov:contest_list:0').setLabel('自分が受けた処分を確認').setStyle(ButtonStyle.Primary)
+        : null,
+      supportsSuspension
+        ? new ButtonBuilder().setCustomId('gov:suspend_list:0').setLabel('現行法の停止を求める').setStyle(ButtonStyle.Danger)
+        : null
+    ].filter(Boolean)) : null
   ].filter(Boolean);
 }
 
@@ -379,6 +384,8 @@ export async function renderGovernanceProcedureHub(guild, governance) {
   const agenda = proposals.filter((proposal) => proposalHandler(proposal) === 'parliament_agenda');
   const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
   const constitution = getActiveConstitution(guild.id);
+  // AI席だけで成立させる憲法では、施行後の停止が人間の唯一の制動なので入口を常設する。
+  const suspensionRequired = constitution?.rules?.workflows?.law?.config?.suspensionRequired ?? null;
   const intervalMs = constitution?.policy.legislation.sessionIntervalMilliseconds ?? 0;
   const nextAt = governance.last_session_at ? Number(governance.last_session_at) + intervalMs : null;
   return {
@@ -387,11 +394,13 @@ export async function renderGovernanceProcedureHub(guild, governance) {
       '',
       `法律にしたいことは <#${governance.parliament_forum_id}> へ投稿してください。違反の通報・上訴・違憲審査は <@&${governance.judiciary_role_id}> に自然文で話してください。`,
       `国会は${Math.round(intervalMs / 3_600_000)}時間ごとに開き、議会の投稿と公開ログを議題として読みます。${nextAt ? `次の開会: <t:${Math.floor(nextAt / 1000)}:R>` : '次の開会: まもなく'}`,
-      '投票と執行承認が始まると、この下に操作カードが出ます。',
+      suspensionRequired
+        ? `成立は国会の席が決めます。施行された法律は${suspensionRequired}人が停止を求めると直ちに止まり、次の国会で維持か廃止を決めます。`
+        : '投票と執行承認が始まると、この下に操作カードが出ます。',
       '',
       `議題 ${agenda.length}件 / いま操作できる案件: 投票 ${voting.length}件 / 承認 ${approvals.length}件`
     ].filter(Boolean).join('\n').slice(0, 1_900),
-    components: procedureComponents(governance, supportsImmediateReview),
+    components: procedureComponents(governance, supportsImmediateReview, Boolean(suspensionRequired)),
     allowedMentions: { parse: [] }
   };
 }

@@ -5,6 +5,8 @@ export const GOVERNANCE_RULES_COMPILER_VERSION = 1;
 
 const HANDLERS = new Set([
   'parliament_agenda',
+  'council_decision',
+  'enactment_hold',
   'constitutional_panel',
   'public_vote',
   'police_review',
@@ -98,9 +100,11 @@ function validateElectorates(electorates) {
 }
 
 function validatePanels(panels) {
-  exactKeys(panels, ['parliament', 'constitutional', 'court', 'police'], 'panels');
+  // councilを書かない憲法は、成立を記名投票で決める手続のまま動く。
+  exactKeys(panels, ['parliament', 'constitutional', 'court', 'police'], 'panels', ['council']);
   const requiredKeys = {
     parliament: ['decision'],
+    council: ['enact'],
     constitutional: ['constitutional', 'unconstitutional'],
     court: ['responsible'],
     police: ['responsible']
@@ -215,6 +219,12 @@ function validateWorkflow(name, workflow) {
   if (name === 'constitutionalCase') {
     exactKeys(workflow.config, ['petitionsPerMemberPerDay'], `workflows.${name}.config`);
     integer(workflow.config.petitionsPerMemberPerDay, `workflows.${name}.config.petitionsPerMemberPerDay`, { min: 1, max: 1000 });
+  } else if (name === 'law') {
+    // 施行後に法律を止める必要数。AI席で成立させる手続では必須になる。
+    exactKeys(workflow.config, [], `workflows.${name}.config`, ['suspensionRequired']);
+    if (workflow.config.suspensionRequired !== undefined) {
+      integer(workflow.config.suspensionRequired, `workflows.${name}.config.suspensionRequired`, { min: 1, max: 100 });
+    }
   } else {
     exactKeys(workflow.config, [], `workflows.${name}.config`);
   }
@@ -230,9 +240,24 @@ function validateWorkflow(name, workflow) {
     if (state.duration !== null) durationMilliseconds(state.duration, `workflows.${name}.states.${stateName}.duration`);
     object(state.config, `workflows.${name}.states.${stateName}.config`);
     object(state.on, `workflows.${name}.states.${stateName}.on`);
-    if (['public_vote', 'defense_window', 'appeal_window'].includes(state.handler)
+    if (['public_vote', 'defense_window', 'appeal_window', 'enactment_hold'].includes(state.handler)
       && (state.duration === null || durationMilliseconds(state.duration) === 0)) {
       throw new Error(`${state.handler} には0より長い期間が必要です。`);
+    }
+    // AI席が成立を決める段階。席と必要票は実行規則のpanelが決める。
+    if (state.handler === 'council_decision') {
+      exactKeys(state.config, ['panel'], `workflows.${name}.states.${stateName}.config`);
+      for (const outcome of ['passed', 'rejected']) {
+        if (!state.on[outcome]) throw new Error(`council_decision には ${outcome} の遷移が必要です。`);
+      }
+    }
+    // 成立前に人間が止められる保留期間。
+    if (state.handler === 'enactment_hold') {
+      exactKeys(state.config, ['required'], `workflows.${name}.states.${stateName}.config`);
+      integer(state.config.required, `workflows.${name}.states.${stateName}.config.required`, { min: 1, max: 100 });
+      for (const outcome of ['expired', 'vetoed']) {
+        if (!state.on[outcome]) throw new Error(`enactment_hold には ${outcome} の遷移が必要です。`);
+      }
     }
     // 国会が動かすまでの待機なので、議題stateに固定の期間は置かない。
     if (state.handler === 'parliament_agenda' && state.duration !== null) {
@@ -261,7 +286,7 @@ function validateWorkflow(name, workflow) {
   if (unreachable.length) throw new Error(`workflows.${name} に到達不能状態があります: ${unreachable.join(', ')}`);
   const waitingHandlers = new Set([
     'parliament_agenda', 'public_vote', 'defense_window', 'public_approval',
-    'contest_window', 'appeal_window', 'terminal'
+    'contest_window', 'appeal_window', 'enactment_hold', 'terminal'
   ]);
   const instant = (stateName) => {
     const item = states[stateName];
@@ -306,10 +331,29 @@ function validateLegislativeWorkflow(name, workflow) {
     throw new Error(`workflows.${name} の継続審議は同じ議題へ戻る必要があります。`);
   }
   requireTransition(workflow, agendaName, 'rejected', 'terminal');
-  const voteName = requireTransition(workflow, agendaName, 'adopted', 'public_vote');
-  requireTransition(workflow, voteName, 'passed', 'terminal');
-  requireTransition(workflow, voteName, 'rejected', 'terminal');
-  if (workflow.states[voteName].on.stale) requireTransition(workflow, voteName, 'stale', 'terminal');
+  const decisionName = workflow.states[agenda.on.adopted]?.handler === 'council_decision'
+    ? requireTransition(workflow, agendaName, 'adopted', 'council_decision')
+    : requireTransition(workflow, agendaName, 'adopted', 'public_vote');
+  const decision = workflow.states[decisionName];
+  requireTransition(workflow, decisionName, 'rejected', 'terminal');
+  if (decision.on.stale) requireTransition(workflow, decisionName, 'stale', 'terminal');
+  if (decision.handler === 'public_vote') {
+    requireTransition(workflow, decisionName, 'passed', 'terminal');
+    return;
+  }
+  // 人間の投票を持たない手続には、人間が止める手段を必ず1つ持たせる。
+  // 法律は施行後の停止、憲法は施行前の保留。施行済みの憲法を巻き戻すと
+  // それを根拠に成立した法律や判決との整合が壊れるため、憲法は事前にだけ止める。
+  if (name === 'constitutionalAmendment') {
+    const holdName = requireTransition(workflow, decisionName, 'passed', 'enactment_hold');
+    requireTransition(workflow, holdName, 'expired', 'terminal');
+    requireTransition(workflow, holdName, 'vetoed', 'terminal');
+  } else {
+    requireTransition(workflow, decisionName, 'passed', 'terminal');
+    if (!Number.isInteger(workflow.config.suspensionRequired) || workflow.config.suspensionRequired < 1) {
+      throw new Error(`workflows.${name} はAI席で成立させるため、施行後に停止できる必要数 (suspensionRequired) が必要です。`);
+    }
+  }
   const agendaStates = Object.values(workflow.states).filter((state) => state.handler === 'parliament_agenda');
   if (agendaStates.length !== 1) throw new Error(`workflows.${name} の議題stateは一つだけです。`);
 }
@@ -327,6 +371,16 @@ export function validateGovernanceRules(input) {
   validateLegislativeWorkflow('law', rules.workflows.law);
   validateLegislativeWorkflow('constitutionalAmendment', rules.workflows.constitutionalAmendment);
   for (const [workflowName, voteName] of [['law', 'law'], ['constitutionalAmendment', 'constitutionalAmendment']]) {
+    const councilStates = Object.values(rules.workflows[workflowName].states)
+      .filter((state) => state.handler === 'council_decision');
+    if (councilStates.length > 1) throw new Error(`workflows.${workflowName} の成立判定は一つだけです。`);
+    if (councilStates.length === 1) {
+      const panel = rules.panels[councilStates[0].config.panel];
+      if (!Number.isInteger(panel?.required?.enact)) {
+        throw new Error(`workflows.${workflowName} の成立判定が参照するpanelがありません: ${councilStates[0].config.panel}`);
+      }
+      continue;
+    }
     const voteStates = Object.values(rules.workflows[workflowName].states)
       .filter((state) => state.handler === 'public_vote');
     if (voteStates.length !== 1 || voteStates[0].config.vote !== voteName

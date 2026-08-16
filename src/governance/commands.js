@@ -11,6 +11,7 @@ import {
 } from 'discord.js';
 import { isGovernanceOperator, loadBootstrapDocuments } from './config.js';
 import {
+  listLaws,
   bootstrapGovernanceGuild,
   claimGovernanceSetupSession,
   createGovernanceSetupSession,
@@ -23,6 +24,7 @@ import {
   updateGovernanceSetupSession
 } from './db.js';
 import {
+  lawSuspensionButtons,
   createGovernanceSurfaces,
   governancePermissionReport,
   postAuthorityChange,
@@ -30,6 +32,8 @@ import {
 } from './discord.js';
 import { policyHash, sha256 } from './policy.js';
 import {
+  fileEnactmentObjection,
+  fileLawSuspension,
   approveCase,
   appealCase,
   backfillGovernanceActivity,
@@ -76,6 +80,40 @@ function reviewListPayload(guildId, userId, offset = 0) {
   if (navigation.components.length) rows.push(navigation);
   return {
     content: ['# 自分が受けた警察の処分', '', ...lines, '', '処分ごとに一度だけ、本人が裁判所の審理を求められます。'].join('\n'),
+    components: rows,
+    flags: EPHEMERAL
+  };
+}
+
+function suspensionListPayload(guildId, offset = 0) {
+  const laws = listLaws(guildId, { activeOnly: true, limit: 100 });
+  const pageSize = 4;
+  const start = Math.max(0, Math.min(Number(offset) || 0, Math.max(0, laws.length - 1)));
+  const page = laws.slice(start, start + pageSize);
+  if (!page.length) return { content: 'いま停止を求められる現行法はありません。', components: [], flags: EPHEMERAL };
+  const rows = page.map((law, index) => {
+    const row = lawSuspensionButtons(law.id)[0];
+    row.components[0].setLabel(`${index + 1}の停止を求める`);
+    return row;
+  });
+  const navigation = new ActionRowBuilder();
+  if (start > 0) {
+    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:suspend_list:${Math.max(0, start - pageSize)}`)
+      .setLabel('前へ').setStyle(ButtonStyle.Secondary));
+  }
+  if (start + pageSize < laws.length) {
+    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:suspend_list:${start + pageSize}`)
+      .setLabel('次へ').setStyle(ButtonStyle.Secondary));
+  }
+  if (navigation.components.length) rows.push(navigation);
+  return {
+    content: [
+      '# 現行法の停止',
+      '',
+      ...page.map((law, index) => `${index + 1}. ${String(law.title).replace(/\s+/g, ' ').slice(0, 180)} v${law.version ?? 1}`),
+      '',
+      '必要数に達すると、その法律は直ちに止まり、次の国会で維持か廃止を決めます。'
+    ].join('\n'),
     components: rows,
     flags: EPHEMERAL
   };
@@ -288,6 +326,37 @@ export async function handleGovernanceComponent(interaction) {
       else await interaction.reply(payload);
       return true;
     }
+    if (customId.startsWith('gov:suspend_list:') && interaction.isButton()) {
+      requireGuild(interaction);
+      const payload = suspensionListPayload(interaction.guildId, Number(customId.split(':')[2]));
+      if (interaction.message?.flags?.has?.(EPHEMERAL)) {
+        const { flags: _flags, ...update } = payload;
+        await interaction.update(update);
+      } else await interaction.reply(payload);
+      return true;
+    }
+    if (customId.startsWith('gov:suspend_reason:') && interaction.isModalSubmit()) {
+      const lawId = Number(customId.split(':')[2]);
+      await interaction.deferReply({ flags: EPHEMERAL });
+      const result = await fileLawSuspension(
+        interaction.guild, interaction.user, lawId, interaction.fields.getTextInputValue('reason')
+      );
+      await interaction.editReply(result.suspended
+        ? `停止を求める人が${result.requests.length}人に達したため、「${result.law.title}」を停止しました。次の国会で維持か廃止を決めます。`
+        : `停止の請求を記録しました（${result.requests.length}/${result.required}人）。必要数に達すると直ちに停止します。`);
+      return true;
+    }
+    if (customId.startsWith('gov:hold_reason:') && interaction.isModalSubmit()) {
+      const proposalId = Number(customId.split(':')[2]);
+      await interaction.deferReply({ flags: EPHEMERAL });
+      const result = await fileEnactmentObjection(
+        interaction.guild, interaction.user, proposalId, interaction.fields.getTextInputValue('reason')
+      );
+      await interaction.editReply(result.vetoed
+        ? `異議が${result.objections.length}人に達したため、この改正は成立しません。`
+        : `改正への異議を記録しました（${result.objections.length}/${result.required}人）。`);
+      return true;
+    }
     if (customId.startsWith('gov:contest:') && interaction.isButton()) {
       const [, , guildId, rawSanctionId] = customId.split(':');
       const guild = interaction.client.guilds.cache.get(guildId)
@@ -339,6 +408,24 @@ export async function handleGovernanceComponent(interaction) {
     const id = Number(rawId);
     if (!Number.isInteger(id) || id < 1) throw new Error('案件IDが壊れています。');
     if (action === 'intake') return await handleGovernanceIntakeComponent(interaction, id, value);
+    if (action === 'suspend' && value === 'request') {
+      const modal = new ModalBuilder().setCustomId(`gov:suspend_reason:${id}`).setTitle('この法律の停止を求める')
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('reason').setLabel('止める理由').setStyle(TextInputStyle.Paragraph)
+            .setRequired(true).setMaxLength(1000)
+        ));
+      await interaction.showModal(modal);
+      return true;
+    }
+    if (action === 'hold' && value === 'object') {
+      const modal = new ModalBuilder().setCustomId(`gov:hold_reason:${id}`).setTitle('この改正に異議')
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('reason').setLabel('成立させない理由').setStyle(TextInputStyle.Paragraph)
+            .setRequired(true).setMaxLength(1000)
+        ));
+      await interaction.showModal(modal);
+      return true;
+    }
     if (action === 'court') {
       const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
       if (value === 'answer') {
