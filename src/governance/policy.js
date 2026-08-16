@@ -1,15 +1,6 @@
 import { createHash } from 'node:crypto';
 
 export const DAY_MS = 86_400_000;
-export const INTERIM_PROTECTION_LIMITS = Object.freeze({
-  minimumMessages: 5,
-  maximumMessages: 30,
-  minimumWindowSeconds: 10,
-  maximumWindowSeconds: 300,
-  minimumDurationSeconds: 60,
-  maximumDurationSeconds: 900
-});
-
 export const AUTOMATIC_TRIGGER_LIMITS = Object.freeze({
   minimumMessages: 5,
   maximumMessages: 30,
@@ -17,31 +8,9 @@ export const AUTOMATIC_TRIGGER_LIMITS = Object.freeze({
   maximumWindowSeconds: 300
 });
 
-export function summaryProcedure(policy) {
-  return policy?.schemaVersion === 2 ? policy.judiciary?.summaryProcedure ?? null : null;
-}
-
-export function usesDeliberativeLegislation(policy) {
-  return Number.isInteger(policy?.legislation?.initialDebateMilliseconds);
-}
-
-export function legislationProcedure(policy) {
-  const legislation = policy?.legislation ?? {};
-  const modern = usesDeliberativeLegislation(policy);
-  return {
-    initialDebateMilliseconds: modern
-      ? legislation.initialDebateMilliseconds
-      : legislation.debateMilliseconds ?? legislation.draftMilliseconds,
-    revisionDebateMilliseconds: modern
-      ? legislation.revisionDebateMilliseconds
-      : legislation.debateMilliseconds ?? legislation.draftMilliseconds,
-    voteMilliseconds: legislation.voteMilliseconds,
-    maximumRevisions: modern ? legislation.maximumRevisions : 2,
-    extendOnLateMaterialFeedback: modern ? legislation.extendOnLateMaterialFeedback : true,
-    lateFeedbackWindowMilliseconds: modern ? legislation.lateFeedbackWindowMilliseconds : 10_800_000,
-    debateExtensionMilliseconds: modern ? legislation.debateExtensionMilliseconds : 21_600_000,
-    maximumDebateExtensions: modern ? legislation.maximumDebateExtensions : 1
-  };
+// 警察の即時処分と、争われたときだけ開く裁判所を分ける手続。
+export function policeProcedure(policy) {
+  return policy?.schemaVersion === 2 ? policy.judiciary?.policeProcedure ?? null : null;
 }
 
 export function validateAutomaticTrigger(value) {
@@ -67,25 +36,6 @@ export function canonicalJson(value) {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
-}
-
-export function validateInterimProtectionDefinition(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  if (Object.keys(value).some((key) => !['trigger', 'durationSeconds'].includes(key))) return false;
-  const trigger = value.trigger;
-  if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) return false;
-  if (Object.keys(trigger).some((key) => !['type', 'minimumMessages', 'windowSeconds'].includes(key))) return false;
-  const limits = INTERIM_PROTECTION_LIMITS;
-  return trigger.type === 'message_burst'
-    && Number.isInteger(trigger.minimumMessages)
-    && trigger.minimumMessages >= limits.minimumMessages
-    && trigger.minimumMessages <= limits.maximumMessages
-    && Number.isInteger(trigger.windowSeconds)
-    && trigger.windowSeconds >= limits.minimumWindowSeconds
-    && trigger.windowSeconds <= limits.maximumWindowSeconds
-    && Number.isInteger(value.durationSeconds)
-    && value.durationSeconds >= limits.minimumDurationSeconds
-    && value.durationSeconds <= limits.maximumDurationSeconds;
 }
 
 function finite(value, name, { min = 0, max = Infinity } = {}) {
@@ -122,37 +72,23 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
   finite(voting.minimumBallots, 'voting.minimumBallots', { max: 100_000 });
   if (!Number.isInteger(voting.minimumBallots)) throw new Error('voting.minimumBallots は整数である必要があります。');
   if (voting.publicBallots !== true) throw new Error('v1の投票は全記名です。');
-  const modernLegislation = Number.isInteger(legislation.initialDebateMilliseconds);
-  const modernLegislationKeys = [
-    'initialDebateMilliseconds', 'revisionDebateMilliseconds', 'voteMilliseconds',
-    'maximumRevisions', 'extendOnLateMaterialFeedback', 'lateFeedbackWindowMilliseconds',
-    'debateExtensionMilliseconds', 'maximumDebateExtensions'
+  const legislationKeys = [
+    'voteMilliseconds', 'sessionIntervalMilliseconds', 'agendaLimit', 'maximumDeferrals', 'logScan'
   ];
-  const legacyLegislationKeys = ['draftMilliseconds', 'debateMilliseconds', 'voteMilliseconds'];
-  const allowedLegislationKeys = new Set(modernLegislation ? modernLegislationKeys : legacyLegislationKeys);
-  if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))) {
+  const allowedLegislationKeys = new Set(legislationKeys);
+  if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))
+    || legislationKeys.some((key) => !(key in legislation))) {
     throw new Error('legislationに未対応の設定があります。');
   }
-  const durationKeys = modernLegislation
-    ? modernLegislationKeys.filter((key) => key.endsWith('Milliseconds'))
-    : legacyLegislationKeys;
-  for (const key of durationKeys) {
+  for (const key of ['voteMilliseconds', 'sessionIntervalMilliseconds']) {
     finite(legislation[key], `legislation.${key}`, { min: technicalOnly ? 60_000 : 3_600_000 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
-  if (modernLegislation) {
-    for (const key of ['maximumRevisions', 'maximumDebateExtensions']) {
-      finite(legislation[key], `legislation.${key}`, { max: technicalOnly ? 20 : 10 });
-      if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
-    }
-    if (legislation.extendOnLateMaterialFeedback !== true && legislation.extendOnLateMaterialFeedback !== false) {
-      throw new Error('legislation.extendOnLateMaterialFeedback は真偽値である必要があります。');
-    }
-    if (legislation.lateFeedbackWindowMilliseconds > legislation.initialDebateMilliseconds
-      || legislation.lateFeedbackWindowMilliseconds > legislation.revisionDebateMilliseconds) {
-      throw new Error('締切直前の論点判定期間が討議期間を超えています。');
-    }
+  for (const key of ['agendaLimit', 'maximumDeferrals']) {
+    finite(legislation[key], `legislation.${key}`, { min: 1, max: 20 });
+    if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
+  if (typeof legislation.logScan !== 'boolean') throw new Error('legislation.logScan は真偽値である必要があります。');
   for (const key of [
     'defenseMilliseconds', 'appealMilliseconds', 'constitutionalChallengesPerMemberPerDay', 'panelSeats', 'guiltyVotesRequired',
     'constitutionalVotesRequired', 'unconstitutionalVotesRequired', 'discordMaximumTimeoutSeconds',
@@ -176,50 +112,39 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
     throw new Error('答弁・上訴期間は最低1時間必要です。');
   }
   if (policy.schemaVersion === 2) {
-    const procedure = judiciary.summaryProcedure;
+    const procedure = judiciary.policeProcedure;
     if (!procedure || typeof procedure !== 'object' || Array.isArray(procedure)) {
-      throw new Error('summaryProcedureがありません。');
+      throw new Error('policeProcedureがありません。');
     }
     const allowedKeys = new Set([
-      'panelSeats', 'votesRequired', 'trialMilliseconds', 'immediateSanctions',
-      'trialFirstSanctions', 'unlimitedWarningReview'
+      'panelSeats', 'votesRequired', 'contestMilliseconds', 'detentionMaximumSeconds',
+      'immediateSanctions', 'courtFirstSanctions', 'unlimitedWarningContest'
     ]);
     if (Object.keys(procedure).some((key) => !allowedKeys.has(key))) {
-      throw new Error('summaryProcedureに未対応の設定があります。');
+      throw new Error('policeProcedureに未対応の設定があります。');
     }
-    for (const key of ['panelSeats', 'votesRequired', 'trialMilliseconds']) {
-      if (!Number.isInteger(procedure[key])) throw new Error(`summaryProcedure.${key}は整数である必要があります。`);
+    for (const key of ['panelSeats', 'votesRequired', 'contestMilliseconds', 'detentionMaximumSeconds']) {
+      if (!Number.isInteger(procedure[key])) throw new Error(`policeProcedure.${key}は整数である必要があります。`);
     }
     if (procedure.panelSeats < 1 || procedure.panelSeats > 5 || procedure.panelSeats % 2 === 0
       || procedure.votesRequired < 1 || procedure.votesRequired > procedure.panelSeats) {
-      throw new Error('summaryProcedureの席数または必要票が不正です。');
+      throw new Error('policeProcedureの席数または必要票が不正です。');
     }
-    if (!technicalOnly
-      && (judiciary.panelSeats !== procedure.panelSeats || judiciary.guiltyVotesRequired !== procedure.votesRequired)) {
-      throw new Error('v2の通常裁判も即時判定と同じ3席中2席である必要があります。');
-    }
-    if (!technicalOnly && (procedure.panelSeats !== 3 || procedure.votesRequired !== 2)) {
-      throw new Error('v2の即時判定は3席中2席で固定です。');
-    }
-    if (!technicalOnly && procedure.trialMilliseconds !== DAY_MS) {
-      throw new Error('v2の裁判期限は24時間で固定です。');
+    // 拘留は保全なので、不服申立ての期限より長く続けられない。
+    if (procedure.detentionMaximumSeconds * 1000 > procedure.contestMilliseconds) {
+      throw new Error('拘留の上限は不服申立て期間を超えられません。');
     }
     const validSanctionSet = (value) => Array.isArray(value)
       && new Set(value).size === value.length
       && value.every((entry) => ['warning', 'restriction', 'timeout', 'kick', 'ban'].includes(entry));
-    const exactSanctions = (value, expected) => validSanctionSet(value)
-      && value.length === expected.length
-      && value.every((entry, index) => entry === expected[index]);
-    if ((!technicalOnly && (!exactSanctions(procedure.immediateSanctions, ['warning', 'restriction', 'timeout'])
-      || !exactSanctions(procedure.trialFirstSanctions, ['kick', 'ban'])))
-      || (technicalOnly && (!validSanctionSet(procedure.immediateSanctions)
-        || !validSanctionSet(procedure.trialFirstSanctions)
-        || procedure.immediateSanctions.some((entry) => procedure.trialFirstSanctions.includes(entry))))) {
-      throw new Error('v2の即時処分・裁判先行処分の区分が不正です。');
+    // どの処分を警察が打てるかは憲法が決める。コードは重複と未知の種別だけ弾く。
+    if (!validSanctionSet(procedure.immediateSanctions)
+      || !validSanctionSet(procedure.courtFirstSanctions)
+      || procedure.immediateSanctions.some((entry) => procedure.courtFirstSanctions.includes(entry))) {
+      throw new Error('警察の即時処分・裁判所送りの区分が不正です。');
     }
-    if ((!technicalOnly && procedure.unlimitedWarningReview !== true)
-      || (technicalOnly && typeof procedure.unlimitedWarningReview !== 'boolean')) {
-      throw new Error('warningの裁判請求設定が不正です。');
+    if (typeof procedure.unlimitedWarningContest !== 'boolean') {
+      throw new Error('warningの不服申立て設定が不正です。');
     }
   }
   if (judiciary.constitutionalChallengesPerMemberPerDay < 1
@@ -309,33 +234,6 @@ export function evaluateEligibility({ joinedAt, now = Date.now(), dailyUniqueCou
   };
 }
 
-export function closeVote({ kind, yes, no, abstain, electorate, trustedNo, trustedTotal, scope = 'all' }, policy) {
-  const decisive = yes + no;
-  const threshold = kind === 'amendment'
-    ? policy.voting.amendmentYesRatio
-    : policy.voting.lawYesRatio;
-  const ratioPassed = decisive > 0 && (kind === 'amendment'
-    ? yes / decisive >= threshold
-    : yes / decisive > threshold);
-  const ballots = yes + no + abstain;
-  const quorumNeeded = Math.max(
-    policy.voting.minimumBallots,
-    Math.ceil(Math.max(0, electorate) * policy.voting.quorumRatio)
-  );
-  const quorumPassed = ballots >= quorumNeeded;
-  const trustedNeeded = trustedTotal > 0 ? Math.ceil(trustedTotal * policy.voting.trustedVetoRatio) : Infinity;
-  const vetoed = scope === 'all' && trustedTotal > 0 && trustedNo >= trustedNeeded;
-  return {
-    passed: ratioPassed && quorumPassed && !vetoed,
-    ratioPassed,
-    quorumPassed,
-    vetoed,
-    threshold,
-    quorumNeeded,
-    trustedNeeded: Number.isFinite(trustedNeeded) ? trustedNeeded : 0
-  };
-}
-
 export function requiredApprovals(sanction, policy) {
   if (!sanction) return Infinity;
   if (sanction.type === 'kick') return policy.judiciary.kickApprovals;
@@ -343,7 +241,7 @@ export function requiredApprovals(sanction, policy) {
   if (sanction.type === 'timeout' && sanction.durationSeconds > policy.judiciary.immediateTimeoutMaximumSeconds) {
     return policy.judiciary.timeoutApprovalsAboveSeconds;
   }
-  if (summaryProcedure(policy)) return 0;
+  if (policeProcedure(policy)) return 0;
   return 0;
 }
 

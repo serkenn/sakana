@@ -168,6 +168,28 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_V5_MAX_NEW_TOKENS, 200),
     label: process.env.MIMIC_V5_LABEL ?? 'evex-5',
     format: process.env.MIMIC_V5_FORMAT ?? 'auto'
+  },
+  // evex-5 と**同じ形・同じ技術**で、切り出しの割合だけ evex-4 の値に戻したもの
+  // (噛み合い 8.4% → 11.8%)。**狙いは外れた** — 噛み合いは 33.3% → 16.7% と
+  // 逆に下がったので、evex-5 が evex-4 に負けている理由は切り出しではない。
+  // 読み比べ用に並べてある
+  'evex-5.1': {
+    url: process.env.MIMIC_V51_URL ?? 'http://127.0.0.1:8775',
+    timeoutMs: number(process.env.MIMIC_V51_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V51_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V51_LABEL ?? 'evex-5.1',
+    format: process.env.MIMIC_V51_FORMAT ?? 'auto'
+  },
+  // **a / b の対照実験は終わった。**同じコーパス (v12) で違うのは
+  // Muon / WSD / 文書内マスク の有無だけ、という比較で **a を採った** —
+  // b は「うん」「あ」のような相槌で終わる率が高かった。8776 が a。
+  // 8777 (b) は落としたので、名前も port も 1 本だけ残す
+  'evex-5.2': {
+    url: process.env.MIMIC_V52_URL ?? 'http://127.0.0.1:8776',
+    timeoutMs: number(process.env.MIMIC_V52_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V52_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V52_LABEL ?? 'evex-5.2',
+    format: process.env.MIMIC_V52_FORMAT ?? 'auto'
   }
 };
 

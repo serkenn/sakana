@@ -70,6 +70,17 @@ export const ENGINES = {
   },
   // 語彙を 4096 → 12288 にして、公開の会話データで土台を作ってから
   // evex だけで仕上げたもの。evex-3 と読み比べるために並べる
+  // **a / b の読み比べは終わり、a を採った。**b は「うん」「あ」のような相槌で
+  // 終わる率が高く、a は必ず内容のある一文を返していた。差は学習のやり方
+  // (b だけ Muon + WSD + 文書内マスク) なので、あれは出力の質には効かない
+  'evex-5.2': {
+    label: 'evex-5.2',
+    summary: 'なりきりを立て直した版。147人それぞれの発言を同じ量ずつ学習させてあるので、指名した人らしさが出やすい。学習のやり方は evex-4.1 と同じに戻してある'
+  },
+  'evex-5.1': {
+    label: 'evex-5.1',
+    summary: 'evex-5 と同じ作りで、一問一答の練習量だけ増やしたもの。長めに喋る傾向がある'
+  },
   'evex-5': {
     label: 'evex-5',
     summary: 'いちばん新しい世代。Gemma 3n の PLE で容量を 36% 増やしつつ、応答の速さは据え置き。リアクションが付いた発言の印を学習していて、返答は「反応されそうな言い方」に寄せてある。言い回しの内輪度は本物の発言とちょうど同じ水準'
@@ -91,19 +102,31 @@ export const ENGINES = {
 
 export const DEFAULT_ENGINE = 'deepseek';
 
+// **消したエンジンの読み替え先。**選択は DB に残るので、名前を消しただけだと
+// `ENGINES[row.engine]` が undefined になって**黙って deepseek に落ちる**。
+// 選び直しを強いるのも筋が違うので、後継に読み替える
+const RENAMED = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2' };
+
 export function engineFor(userId) {
   const row = getStmt.get(String(userId));
-  return ENGINES[row?.engine] ? row.engine : DEFAULT_ENGINE;
+  const engine = RENAMED[row?.engine] ?? row?.engine;
+  return ENGINES[engine] ? engine : DEFAULT_ENGINE;
 }
 
 export function setEngine(userId, engine) {
-  if (!ENGINES[engine]) return false;
-  setStmt.run(String(userId), engine, Date.now());
+  const target = RENAMED[engine] ?? engine;
+  if (!ENGINES[target]) return false;
+  setStmt.run(String(userId), target, Date.now());
   return true;
 }
 
 /** 誰がどれを使っているかの内訳。/model の表示に出す。 */
 export function engineCounts() {
-  const counts = new Map(countStmt.all().map((row) => [row.engine, row.n]));
+  // 読み替えたぶんも足す。素の行のままだと消したエンジンの人が数から消える
+  const counts = new Map();
+  for (const row of countStmt.all()) {
+    const key = RENAMED[row.engine] ?? row.engine;
+    counts.set(key, (counts.get(key) ?? 0) + row.n);
+  }
   return Object.keys(ENGINES).map((key) => ({ engine: key, users: counts.get(key) ?? 0 }));
 }

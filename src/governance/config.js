@@ -50,8 +50,9 @@ export const governanceConfig = {
   maxOutputTokens: number(process.env.GOVERNANCE_MAX_OUTPUT_TOKENS, 8000),
   httpTimeoutMs: number(process.env.GOVERNANCE_HTTP_TIMEOUT_MS, 120_000),
   maxConcurrent: Math.max(1, Math.floor(number(process.env.GOVERNANCE_MAX_CONCURRENT, 3))),
-  weeklyScanEnabled: flag(process.env.GOVERNANCE_WEEKLY_SCAN, true),
-  weeklyDraftLimit: number(process.env.GOVERNANCE_WEEKLY_DRAFT_LIMIT, 3),
+  lawSiteUrl: firstNonEmpty(process.env.GOVERNANCE_LAW_API_URL).replace(/\/+$/, ''),
+  lawSiteToken: firstNonEmpty(process.env.GOVERNANCE_LAW_API_TOKEN),
+  lawSitePublicUrl: firstNonEmpty(process.env.GOVERNANCE_LAW_SITE_URL).replace(/\/+$/, ''),
   schedulerIntervalMs: number(process.env.GOVERNANCE_SCHEDULER_INTERVAL_MS, 60_000),
   generalDailyCalls: number(process.env.GOVERNANCE_GENERAL_DAILY_CALLS, 20),
   trustedDailyCalls: number(process.env.GOVERNANCE_TRUSTED_DAILY_CALLS, 200),
@@ -63,11 +64,7 @@ export const governanceConfig = {
   investigationGuildLimit: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_GUILD_LIMIT, 300, 500),
   investigationConversationHours: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_CONVERSATION_HOURS, 24, 720),
   investigationLookbackDays: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_LOOKBACK_DAYS, 7, 30),
-  investigationCaseLimit: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_CASE_LIMIT, 5, 10),
-  // 法令サイトのorigin。0なら起動しない。tunnelの先に出すのでloopback既定。
-  statuteApiPort: number(process.env.STATUTE_HTTP_PORT, 0),
-  statuteApiHost: firstNonEmpty(process.env.STATUTE_HTTP_HOST, '127.0.0.1'),
-  statuteApiToken: firstNonEmpty(process.env.STATUTE_HTTP_TOKEN, '')
+  investigationCaseLimit: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_CASE_LIMIT, 5, 10)
 };
 
 export function communityDisplayName(value) {
@@ -105,8 +102,6 @@ export function isGovernanceOperator(member) {
 }
 
 export const OPERATIONAL_SETTING_DEFAULTS = Object.freeze({
-  weekly_scan_enabled: governanceConfig.weeklyScanEnabled ? 1 : 0,
-  weekly_draft_limit: governanceConfig.weeklyDraftLimit,
   general_daily_calls: governanceConfig.generalDailyCalls,
   trusted_daily_calls: governanceConfig.trustedDailyCalls,
   notification_everyone_daily_limit: governanceConfig.notificationEveryoneDailyLimit,
@@ -124,10 +119,6 @@ export function parseOperationalSetting(key, raw) {
   if (!(key in OPERATIONAL_SETTING_DEFAULTS)) return { ok: false, error: '変更できない設定です。' };
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) return { ok: false, error: '0以上の整数を指定してください。' };
-  if (key === 'weekly_scan_enabled' && ![0, 1].includes(value)) {
-    return { ok: false, error: '自律起案の有効・無効は 0 または 1 です。' };
-  }
-  if (key === 'weekly_draft_limit' && value > 10) return { ok: false, error: '自律起案の週最大件数は10以下です。' };
   if (key.endsWith('_daily_calls') && value > 10_000) return { ok: false, error: 'AI受付回数は10000以下です。' };
   const investigationMaximums = {
     investigation_conversation_limit: 100,

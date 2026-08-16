@@ -621,7 +621,7 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
     ['procedure_version', 'INTEGER NOT NULL DEFAULT 1'],
     ['decision_due_at', 'INTEGER'],
     ['response_completed_at', 'INTEGER'],
-    ['summary_event_key', 'TEXT'],
+    ['police_event_key', 'TEXT'],
     ['review_count', 'INTEGER NOT NULL DEFAULT 0']
   ]) {
     if (!caseColumns.has(name)) db.exec(`ALTER TABLE governance_cases ADD COLUMN ${name} ${definition}`);
@@ -635,8 +635,8 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
   }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_gov_case_summary_event
-    ON governance_cases(guild_id, summary_event_key)
-    WHERE summary_event_key IS NOT NULL
+    ON governance_cases(guild_id, police_event_key)
+    WHERE police_event_key IS NOT NULL
   `);
   // 施行途中の事件は、その後に憲法が改正されても受付時の手続を維持する。
   // v12導入前の行には当時の現行憲法を一度だけ固定する。
@@ -762,7 +762,15 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
     WHERE id = ?
   `);
   for (const row of constitutions) {
-    const compiled = compileConstitution({ content: row.content, policy: JSON.parse(row.policy_json) });
+    // 旧形式の憲法はもう解釈できない。ここで落とすとbot全体が起動できなくなるので、
+    // 行はそのまま残し、その憲法を実際に使う経路で失敗させる。
+    let compiled;
+    try {
+      compiled = compileConstitution({ content: row.content });
+    } catch (error) {
+      console.error(`Constitution ${row.id} has no executable rules block:`, error?.message ?? error);
+      continue;
+    }
     updateConstitutionRules.run(
       compiled.sourceFormat,
       canonicalJson(compiled.rules),
@@ -975,64 +983,71 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (18, ?)').run(Date.now());
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS governance_proposal_objections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    proposal_id INTEGER NOT NULL,
-    revision INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'revision',
-    user_id TEXT NOT NULL,
-    instruction TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    UNIQUE (proposal_id, revision, kind, user_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_gov_proposal_objections
-    ON governance_proposal_objections(proposal_id, revision, kind, id);
-`);
+{
+  const proposalColumns = new Set(db.pragma('table_info(governance_proposals)').map((row) => row.name));
+  if (!proposalColumns.has('deferrals')) {
+    db.exec('ALTER TABLE governance_proposals ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0');
+  }
+  const guildColumns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  for (const [name, definition] of [
+    ['last_session_at', 'INTEGER'],
+    ['session_retry_after', 'INTEGER'],
+    ['session_failure_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['session_last_error', 'TEXT']
+  ]) {
+    if (!guildColumns.has(name)) db.exec(`ALTER TABLE governance_guilds ADD COLUMN ${name} ${definition}`);
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS governance_parliament_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      constitution_id INTEGER NOT NULL,
+      manual INTEGER NOT NULL DEFAULT 0,
+      agenda_count INTEGER NOT NULL DEFAULT 0,
+      outcomes_json TEXT NOT NULL DEFAULT '[]',
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_gov_parliament_sessions
+      ON governance_parliament_sessions(guild_id, started_at);
+
+    CREATE TABLE IF NOT EXISTS governance_law_publications (
+      guild_id TEXT NOT NULL,
+      instrument_type TEXT NOT NULL,
+      instrument_id TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      publication_status TEXT NOT NULL,
+      pushed_at INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, instrument_type, instrument_id)
+    );
+  `);
+}
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (19, ?)').run(Date.now());
 
 db.exec(`
-  CREATE TABLE IF NOT EXISTS governance_parliament_sessions (
+  CREATE TABLE IF NOT EXISTS governance_detentions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL UNIQUE,
     guild_id TEXT NOT NULL,
-    opened_at INTEGER NOT NULL,
-    closed_at INTEGER,
-    record_json TEXT NOT NULL,
-    thread_id TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_gov_parliament_sessions
-    ON governance_parliament_sessions(guild_id, opened_at);
-
-  CREATE TABLE IF NOT EXISTS governance_parliament_opinions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    title TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    source TEXT NOT NULL,
-    source_message_id TEXT,
-    status TEXT NOT NULL,
-    session_id INTEGER,
-    decision_json TEXT,
-    created_at INTEGER NOT NULL,
-    decided_at INTEGER
-  );
-  CREATE INDEX IF NOT EXISTS idx_gov_parliament_opinions
-    ON governance_parliament_opinions(guild_id, status, created_at);
-
-  CREATE TABLE IF NOT EXISTS governance_law_suspensions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id TEXT NOT NULL,
-    law_id INTEGER NOT NULL,
     user_id TEXT NOT NULL,
     reason TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    UNIQUE (law_id, user_id)
+    duration_seconds INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    ends_at INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    released_at INTEGER,
+    created_at INTEGER NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS idx_gov_law_suspensions
-    ON governance_law_suspensions(guild_id, law_id, id);
+  CREATE INDEX IF NOT EXISTS idx_gov_detention_active
+    ON governance_detentions(guild_id, user_id, status, ends_at);
 `);
+{
+  const columns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  // 警察の処分は裁判所ではなく手続の執行記録へ公開する。裁判所は争われた事件だけを持つ。
+  if (!columns.has('enforcement_thread_id')) {
+    db.exec("ALTER TABLE governance_guilds ADD COLUMN enforcement_thread_id TEXT NOT NULL DEFAULT ''");
+  }
+}
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (20, ?)').run(Date.now());
 
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
@@ -1241,8 +1256,8 @@ export function updateGovernanceGuild(guildId, patch) {
     'legislature_role_id', 'judiciary_role_id', 'category_id',
     'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id',
     'procedure_channel_id', 'procedure_message_id', 'operations_thread_id',
-    'active_constitution_id', 'last_weekly_scan_at', 'weekly_retry_after',
-    'weekly_failure_count', 'weekly_last_error'
+    'active_constitution_id', 'last_session_at', 'session_retry_after',
+    'session_failure_count', 'session_last_error', 'enforcement_thread_id'
   ]);
   const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
   if (entries.length === 0) return getGovernanceGuild(guildId);
@@ -1725,6 +1740,61 @@ export function proposalDiscussion(proposalId, since, until, limit = 300) {
   );
 }
 
+// 提案スレは議題になる前から人間が討論する。proposal行の有無に関係なくthread単位で読む。
+export function threadDiscussion(guildId, threadId, since, limit = 300) {
+  return db.prepare(`
+    SELECT message_id, user_id, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND created_at >= ? AND content <> ''
+    ORDER BY created_at, message_id LIMIT ?
+  `).all(String(guildId), String(threadId), Number(since), Number(limit));
+}
+
+export function recordParliamentSession({ guildId, constitutionId, manual = false, agendaCount = 0, outcomes = [], startedAt }) {
+  const result = db.prepare(`
+    INSERT INTO governance_parliament_sessions
+      (guild_id, constitution_id, manual, agenda_count, outcomes_json, started_at, finished_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    String(guildId), Number(constitutionId), manual ? 1 : 0,
+    Number(agendaCount), canonicalJson(outcomes), Number(startedAt), Date.now()
+  );
+  return Number(result.lastInsertRowid);
+}
+
+export function listParliamentSessions(guildId, { limit = 10 } = {}) {
+  return db.prepare(`
+    SELECT * FROM governance_parliament_sessions WHERE guild_id = ? ORDER BY id DESC LIMIT ?
+  `).all(String(guildId), Number(limit)).map((row) => ({ ...row, outcomes: parseJson(row.outcomes_json, []) }));
+}
+
+export function getLawPublication(guildId, instrumentType, instrumentId) {
+  return db.prepare(`
+    SELECT * FROM governance_law_publications
+    WHERE guild_id = ? AND instrument_type = ? AND instrument_id = ?
+  `).get(String(guildId), String(instrumentType), String(instrumentId)) ?? null;
+}
+
+export function upsertLawPublication({ guildId, instrumentType, instrumentId, contentHash, publicationStatus }) {
+  db.prepare(`
+    INSERT INTO governance_law_publications
+      (guild_id, instrument_type, instrument_id, content_hash, publication_status, pushed_at)
+    VALUES (@guild_id, @instrument_type, @instrument_id, @content_hash, @publication_status, @pushed_at)
+    ON CONFLICT (guild_id, instrument_type, instrument_id) DO UPDATE SET
+      content_hash = excluded.content_hash,
+      publication_status = excluded.publication_status,
+      pushed_at = excluded.pushed_at
+  `).run({
+    guild_id: String(guildId),
+    instrument_type: String(instrumentType),
+    instrument_id: String(instrumentId),
+    content_hash: String(contentHash),
+    publication_status: String(publicationStatus),
+    pushed_at: Date.now()
+  });
+  return getLawPublication(guildId, instrumentType, instrumentId);
+}
+
 export function ensureWorkflowInstance({
   guildId, constitutionId, workflowKey, subjectType, subjectId, currentState,
   stateEnteredAt = Date.now(), wakeAt = null, context = {}, status = 'active'
@@ -2102,7 +2172,7 @@ export function listProposals(guildId, { statuses = null, limit = 25 } = {}) {
 export const updateProposal = db.transaction((id, patch) => {
   const allowed = new Set([
     'title', 'summary', 'body_json', 'status', 'forum_thread_id', 'forum_message_id',
-    'stage_started_at', 'stage_ends_at', 'revision', 'debate_extensions',
+    'stage_started_at', 'stage_ends_at', 'revision', 'deferrals',
     'retry_after', 'failure_count', 'last_error', 'relation_type', 'target_type', 'target_id', 'target_hash'
   ]);
   const normalized = { ...patch };
@@ -2133,6 +2203,27 @@ export const updateProposal = db.transaction((id, patch) => {
   return getProposal(id);
 });
 
+// 国会が改憲だと判断した議題は、同じスレのまま改憲workflowへ移す。
+// 両workflowはstate名が同じなので、workflow_keyも合わせて付け替える。
+export const setProposalKind = db.transaction((id, kind) => {
+  if (!['law', 'amendment'].includes(kind)) throw new Error('未対応の案件種別です。');
+  const proposal = getProposal(id);
+  if (!proposal) throw new Error('案件がありません。');
+  if (proposal.kind === kind) return proposal;
+  const workflowKey = kind === 'amendment' ? 'constitutionalAmendment' : 'law';
+  const rules = parseJson(proposalRulesStmt.get(Number(proposal.constitution_id))?.rules_json, null);
+  if (!rules?.workflows?.[workflowKey]?.states?.[proposal.status]) {
+    throw new Error('現在の段階を移行先のworkflowで解釈できません。');
+  }
+  db.prepare('UPDATE governance_proposals SET kind = ?, updated_at = ? WHERE id = ?')
+    .run(kind, Date.now(), Number(id));
+  db.prepare(`
+    UPDATE governance_workflow_instances SET workflow_key = ?, updated_at = ?
+    WHERE subject_type = 'proposal' AND subject_id = ?
+  `).run(workflowKey, Date.now(), String(id));
+  return getProposal(id);
+});
+
 export function recordProposalDeliberation({ proposalId, revision, outcome, discussion, decision }) {
   const result = db.prepare(`
     INSERT INTO governance_proposal_deliberations
@@ -2147,115 +2238,6 @@ export function recordProposalDeliberation({ proposalId, revision, outcome, disc
     Date.now()
   );
   return Number(result.lastInsertRowid);
-}
-
-/**
- * 定期国会。開会から閉会までの議題と採否を1行に残し、会議録として公開する。
- */
-export function createParliamentSession(guildId, record = {}) {
-  const now = Date.now();
-  const result = db.prepare(`
-    INSERT INTO governance_parliament_sessions (guild_id, opened_at, record_json) VALUES (?, ?, ?)
-  `).run(String(guildId), now, canonicalJson(record));
-  return getParliamentSession(Number(result.lastInsertRowid));
-}
-
-export function getParliamentSession(id) {
-  const row = db.prepare('SELECT * FROM governance_parliament_sessions WHERE id = ?').get(Number(id));
-  return row ? { ...row, record: parseJson(row.record_json, {}) } : null;
-}
-
-export function closeParliamentSession(id, record, threadId = null) {
-  db.prepare('UPDATE governance_parliament_sessions SET closed_at = ?, record_json = ?, thread_id = ? WHERE id = ?')
-    .run(Date.now(), canonicalJson(record), threadId, Number(id));
-  return getParliamentSession(id);
-}
-
-export function listParliamentSessions(guildId, { limit = 20 } = {}) {
-  return db.prepare(`
-    SELECT * FROM governance_parliament_sessions WHERE guild_id = ? ORDER BY opened_at DESC LIMIT ?
-  `).all(String(guildId), Number(limit)).map((row) => ({ ...row, record: parseJson(row.record_json, {}) }));
-}
-
-/**
- * 国会へ出す意見。受け取った時点では案件にならず、次の開会で採否を決める。
- */
-export function recordParliamentOpinion({
-  guildId, userId, kind, title, summary, source, sourceMessageId = null
-}) {
-  const result = db.prepare(`
-    INSERT INTO governance_parliament_opinions
-      (guild_id, user_id, kind, title, summary, source, source_message_id, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-  `).run(
-    String(guildId), String(userId), String(kind), String(title), String(summary),
-    String(source), sourceMessageId === null ? null : String(sourceMessageId), Date.now()
-  );
-  return getParliamentOpinion(Number(result.lastInsertRowid));
-}
-
-export function getParliamentOpinion(id) {
-  const row = db.prepare('SELECT * FROM governance_parliament_opinions WHERE id = ?').get(Number(id));
-  return row ? { ...row, decision: parseJson(row.decision_json, null) } : null;
-}
-
-export function listParliamentOpinions(guildId, { status = 'pending', limit = 100 } = {}) {
-  const rows = status
-    ? db.prepare(`
-        SELECT * FROM governance_parliament_opinions
-        WHERE guild_id = ? AND status = ? ORDER BY id LIMIT ?
-      `).all(String(guildId), String(status), Number(limit))
-    : db.prepare('SELECT * FROM governance_parliament_opinions WHERE guild_id = ? ORDER BY id DESC LIMIT ?')
-      .all(String(guildId), Number(limit));
-  return rows.map((row) => ({ ...row, decision: parseJson(row.decision_json, null) }));
-}
-
-export function settleParliamentOpinion(id, { status, sessionId, decision }) {
-  db.prepare(`
-    UPDATE governance_parliament_opinions
-    SET status = ?, session_id = ?, decision_json = ?, decided_at = ?
-    WHERE id = ?
-  `).run(String(status), sessionId === null ? null : Number(sessionId), canonicalJson(decision ?? {}), Date.now(), Number(id));
-  return getParliamentOpinion(id);
-}
-
-/**
- * 施行済みの法律を止める要求。1法律1人1件で、必要数に達したらその法律を停止し、
- * 次の国会で維持するか廃止するかを決める。AIだけで成立させる手続の唯一の制動。
- */
-export function recordLawSuspension({ guildId, lawId, userId, reason }) {
-  db.prepare(`
-    INSERT INTO governance_law_suspensions (guild_id, law_id, user_id, reason, created_at)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(law_id, user_id) DO UPDATE SET reason = excluded.reason, created_at = excluded.created_at
-  `).run(String(guildId), Number(lawId), String(userId), String(reason), Date.now());
-  return listLawSuspensions(lawId);
-}
-
-export function listLawSuspensions(lawId) {
-  return db.prepare('SELECT * FROM governance_law_suspensions WHERE law_id = ? ORDER BY id').all(Number(lawId));
-}
-
-/**
- * 調整を求める異議。1つの版につき1人1件で、数が実行規則の必要数に達したときだけ
- * 調整案を作る。誰の異議かは公開記録なので、後から数え直せる形で残す。
- */
-export function recordProposalObjection({ proposalId, revision, userId, instruction, kind = 'revision' }) {
-  db.prepare(`
-    INSERT INTO governance_proposal_objections (proposal_id, revision, kind, user_id, instruction, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(proposal_id, revision, kind, user_id)
-      DO UPDATE SET instruction = excluded.instruction, created_at = excluded.created_at
-  `).run(Number(proposalId), Number(revision), String(kind), String(userId), String(instruction), Date.now());
-  return listProposalObjections(proposalId, revision, kind);
-}
-
-export function listProposalObjections(proposalId, revision, kind = 'revision') {
-  return db.prepare(`
-    SELECT * FROM governance_proposal_objections
-    WHERE proposal_id = ? AND revision = ? AND kind = ?
-    ORDER BY id
-  `).all(Number(proposalId), Number(revision), String(kind));
 }
 
 export function listProposalDeliberations(proposalId) {
@@ -2543,7 +2525,7 @@ export function createCase(input) {
     INSERT INTO governance_cases
       (guild_id, kind, reporter_id, accused_id, law_id, offense_code, challenged_type, challenged_id,
       summary, status, defense_until, alleged_at, constitution_id, procedure_version,
-      decision_due_at, summary_event_key, created_at, updated_at)
+      decision_due_at, police_event_key, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId, input.kind ?? 'criminal', input.reporterId, input.accusedId ?? null,
@@ -2551,7 +2533,7 @@ export function createCase(input) {
     input.challengedId === null || input.challengedId === undefined ? null : String(input.challengedId),
     input.summary, input.status ?? 'filed', input.defenseUntil ?? null,
     input.allegedAt ?? null, input.constitutionId ?? null, input.procedureVersion ?? 1,
-    input.decisionDueAt ?? null, input.summaryEventKey ?? null,
+    input.decisionDueAt ?? null, input.policeEventKey ?? null,
     now, now
   );
   const created = getCase(Number(result.lastInsertRowid));
@@ -2597,17 +2579,17 @@ export function listCases(guildId, { statuses = null, limit = 25 } = {}) {
     .all(guildId, limit).map(hydrateCase);
 }
 
-export function findCaseBySummaryEvent(guildId, summaryEventKey) {
+export function findCaseByPoliceEvent(guildId, policeEventKey) {
   return hydrateCase(db.prepare(`
-    SELECT * FROM governance_cases WHERE guild_id = ? AND summary_event_key = ? LIMIT 1
-  `).get(String(guildId), String(summaryEventKey)));
+    SELECT * FROM governance_cases WHERE guild_id = ? AND police_event_key = ? LIMIT 1
+  `).get(String(guildId), String(policeEventKey)));
 }
 
-export function findRecentSummaryCase(guildId, userId, lawId, offenseCode, since) {
+export function findRecentPoliceCase(guildId, userId, lawId, offenseCode, since) {
   return hydrateCase(db.prepare(`
     SELECT * FROM governance_cases
     WHERE guild_id = ? AND accused_id = ? AND law_id = ? AND offense_code = ?
-      AND procedure_version = 2 AND summary_event_key IS NOT NULL AND created_at >= ?
+      AND procedure_version = 2 AND police_event_key IS NOT NULL AND created_at >= ?
     ORDER BY id DESC LIMIT 1
   `).get(String(guildId), String(userId), Number(lawId), String(offenseCode), Number(since)));
 }
@@ -2635,7 +2617,7 @@ export const updateCase = db.transaction((id, patch) => {
     'status', 'public_thread_id', 'private_thread_id', 'defense_until', 'panel_id',
     'verdict_json', 'finalized_at', 'retry_after', 'failure_count', 'last_error', 'alleged_at',
     'constitution_id', 'procedure_version', 'decision_due_at', 'response_completed_at',
-    'summary_event_key', 'review_count'
+    'police_event_key', 'review_count'
   ]);
   const normalized = { ...patch };
   if ('verdict' in normalized) {
@@ -2816,7 +2798,7 @@ export function listSanctions(guildId, statuses = null) {
     .map((row) => ({ ...row, profile: parseJson(row.profile_json, null) }));
 }
 
-export function listReviewableSanctions(guildId, userId) {
+export function listContestableSanctions(guildId, userId) {
   return db.prepare(`
     SELECT s.* FROM governance_sanctions s
     JOIN governance_cases c ON c.id = s.case_id
@@ -2893,6 +2875,54 @@ export function deactivateRestrictionForSanction(sanctionId, status = 'reversed'
     UPDATE governance_active_restrictions SET status = ?
     WHERE sanction_id = ? AND status = 'active'
   `).run(status, sanctionId).changes;
+}
+
+// 拘留は罰ではない保全なので、刑ではなく事件へ紐づけて時間だけを持つ。
+export function createDetention({ caseId, guildId, userId, reason, durationSeconds, startedAt, endsAt, status }) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO governance_detentions
+      (case_id, guild_id, user_id, reason, duration_seconds, started_at, ends_at, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(caseId), String(guildId), String(userId), String(reason).slice(0, 500),
+    Number(durationSeconds), Number(startedAt), Number(endsAt), String(status), now
+  );
+  return getCaseDetention(caseId);
+}
+
+export function getCaseDetention(caseId) {
+  return db.prepare('SELECT * FROM governance_detentions WHERE case_id = ?').get(Number(caseId)) ?? null;
+}
+
+export function activeDetentions(guildId, userId, now = Date.now()) {
+  return db.prepare(`
+    SELECT * FROM governance_detentions
+    WHERE guild_id = ? AND user_id = ? AND status = 'active' AND ends_at > ?
+  `).all(String(guildId), String(userId), Number(now));
+}
+
+export function releaseDetention(caseId, now = Date.now()) {
+  db.prepare("UPDATE governance_detentions SET status = 'released', released_at = ? WHERE case_id = ? AND status = 'active'")
+    .run(Number(now), Number(caseId));
+  return getCaseDetention(caseId);
+}
+
+export function expireDetentions(now = Date.now()) {
+  const rows = db.prepare("SELECT * FROM governance_detentions WHERE status = 'active' AND ends_at <= ?").all(Number(now));
+  if (rows.length) {
+    db.prepare("UPDATE governance_detentions SET status = 'expired', released_at = ? WHERE status = 'active' AND ends_at <= ?")
+      .run(Number(now), Number(now));
+  }
+  return rows;
+}
+
+// 拘留された時間は、同じ事件で後から科す期間処分の刑期から差し引く。
+export function detainedSeconds(caseId, now = Date.now()) {
+  const row = getCaseDetention(caseId);
+  if (!row) return 0;
+  const until = row.released_at ?? Math.min(now, row.ends_at);
+  return Math.max(0, Math.floor((until - row.started_at) / 1000));
 }
 
 export function createInterimProtection(input) {

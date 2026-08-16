@@ -178,20 +178,6 @@ client.once(Events.ClientReady, (readyClient) => {
     console.error('Catch-up failed:', error);
   });
 
-  if (governanceConfig.enabled && governanceConfig.statuteApiPort > 0) {
-    // 法令サイトのorigin。Cloudflare Tunnel がこのloopbackを拾う。
-    import('./governance/http.js').then(({ startStatuteServer }) => {
-      startStatuteServer({
-        port: governanceConfig.statuteApiPort,
-        host: governanceConfig.statuteApiHost,
-        token: governanceConfig.statuteApiToken
-      });
-      console.log(`Statute API listening on ${governanceConfig.statuteApiHost}:${governanceConfig.statuteApiPort}`);
-    }).catch((error) => {
-      console.error('Statute API failed to start:', error);
-    });
-  }
-
   if (governanceConfig.enabled) {
     const run = () => runGovernanceScheduler(readyClient).catch((error) => {
       console.error('Governance scheduler failed:', error);
@@ -331,7 +317,7 @@ async function handleMessageCreate(message) {
     return;
   }
 
-  // @立法 / @裁判 は一般agentより先に、権限を持たない構造化受付へ渡す。
+  // @通報 は一般agentより先に、権限を持たない構造化受付へ渡す。
   // role mentionを一般会話の文脈として解釈させると、統治操作との境界が曖昧になる。
   if (governanceConfig.enabled && await handleGovernanceMention(message)) {
     return;

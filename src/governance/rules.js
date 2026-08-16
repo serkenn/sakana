@@ -4,29 +4,20 @@ export const GOVERNANCE_RULES_SCHEMA = 'sakana.governance-rules/v1';
 export const GOVERNANCE_RULES_COMPILER_VERSION = 1;
 
 const HANDLERS = new Set([
-  'draft',
-  'public_discussion',
-  'ai_deliberation',
-  'objection_window',
-  'council_decision',
-  'enactment_hold',
-  'proposal_relation_review',
+  'parliament_agenda',
   'constitutional_panel',
   'public_vote',
-  'summary_review',
+  'police_review',
   'defense_window',
   'judicial_panel',
   'public_approval',
-  'review_window',
+  'contest_window',
   'appeal_window',
   'sanction_execution',
-  'publication',
   'terminal'
 ]);
 
 export const VOTE_EARLY_CLOSE = new Set(['never', 'all_ballots_cast']);
-const DISCUSSION_PHASES = ['initial', 'revision', 'legacy_draft', 'legacy_debate'];
-const QUIET_CLOSE_PHASES = ['initial', 'revision'];
 
 const DURATION_RE = /^(immediate|[1-9]\d*(?:m|h|d))$/;
 const MAX_DURATION_MS = 365 * 86_400_000;
@@ -107,20 +98,12 @@ function validateElectorates(electorates) {
 }
 
 function validatePanels(panels) {
-  // debateReflectionを書かない旧憲法は、討議の反映漏れ検査を持たないまま動く。
-  exactKeys(
-    panels,
-    ['proposalRelation', 'constitutional', 'criminal', 'summary'],
-    'panels',
-    ['debateReflection', 'council']
-  );
+  exactKeys(panels, ['parliament', 'constitutional', 'court', 'police'], 'panels');
   const requiredKeys = {
-    proposalRelation: ['decision'],
+    parliament: ['decision'],
     constitutional: ['constitutional', 'unconstitutional'],
-    criminal: ['responsible'],
-    summary: ['responsible'],
-    debateReflection: ['unreflected'],
-    council: ['adopt', 'enact']
+    court: ['responsible'],
+    police: ['responsible']
   };
   for (const [name, panel] of Object.entries(panels)) {
     exactKeys(panel, ['seats', 'required'], `panels.${name}`);
@@ -132,6 +115,18 @@ function validatePanels(panels) {
       integer(needed, `panels.${name}.required.${outcome}`, { min: 1, max: panel.seats });
     }
   }
+}
+
+// 開会の間隔や1回の議題数は運用値ではなく統治の中身なので、運営panelではなく
+// 憲法の実行規則に置く。変えるには改憲手続が要る。
+function validateParliament(parliament) {
+  exactKeys(parliament, ['sessionInterval', 'agendaLimit', 'maximumDeferrals', 'logScan'], 'parliament');
+  const interval = durationMilliseconds(parliament.sessionInterval, 'parliament.sessionInterval');
+  if (interval < 3_600_000) throw new Error('parliament.sessionInterval は1時間以上である必要があります。');
+  if (interval > 30 * 86_400_000) throw new Error('parliament.sessionInterval の技術上限は30日です。');
+  integer(parliament.agendaLimit, 'parliament.agendaLimit', { min: 1, max: 20 });
+  integer(parliament.maximumDeferrals, 'parliament.maximumDeferrals', { min: 1, max: 20 });
+  if (typeof parliament.logScan !== 'boolean') throw new Error('parliament.logScan は真偽値である必要があります。');
 }
 
 function validateVotes(votes) {
@@ -168,7 +163,7 @@ function validateVotes(votes) {
 function validateSanctions(sanctions) {
   exactKeys(sanctions, [
     'allowed', 'restrictionPrimitives', 'maximumRestriction', 'timeout',
-    'approvals', 'appeals', 'summaryProcedure'
+    'approvals', 'appeals', 'detention', 'police'
   ], 'sanctions');
   const types = ['warning', 'restriction', 'timeout', 'kick', 'ban'];
   if (!Array.isArray(sanctions.allowed) || new Set(sanctions.allowed).size !== sanctions.allowed.length
@@ -195,35 +190,29 @@ function validateSanctions(sanctions) {
     || canonicalJson([...sanctions.appeals.types].sort()) !== canonicalJson(['ban', 'timeout'])) {
     throw new Error('現在のDiscord実行系で上訴対象にできる処分は ban と timeout だけです。');
   }
-  exactKeys(sanctions.summaryProcedure, ['trialDuration', 'immediate', 'trialFirst', 'unlimitedWarningReview'], 'sanctions.summaryProcedure');
-  durationMilliseconds(sanctions.summaryProcedure.trialDuration, 'sanctions.summaryProcedure.trialDuration');
-  for (const key of ['immediate', 'trialFirst']) {
-    if (!Array.isArray(sanctions.summaryProcedure[key])
-      || sanctions.summaryProcedure[key].some((type) => !types.includes(type))) throw new Error(`sanctions.summaryProcedure.${key} が不正です。`);
+  // 拘留は罰ではなく保全なので、種類ではなく上限時間だけを憲法が決める。
+  exactKeys(sanctions.detention, ['maximum'], 'sanctions.detention');
+  const detention = durationMilliseconds(sanctions.detention.maximum, 'sanctions.detention.maximum');
+  if (detention < 60_000) throw new Error('sanctions.detention.maximum は1分以上である必要があります。');
+  if (detention > 86_400_000) throw new Error('拘留は保全なので24時間を超えられません。');
+  exactKeys(sanctions.police, ['contestDuration', 'immediate', 'courtFirst', 'unlimitedWarningContest'], 'sanctions.police');
+  durationMilliseconds(sanctions.police.contestDuration, 'sanctions.police.contestDuration');
+  for (const key of ['immediate', 'courtFirst']) {
+    if (!Array.isArray(sanctions.police[key])
+      || sanctions.police[key].some((type) => !types.includes(type))) throw new Error(`sanctions.police.${key} が不正です。`);
   }
-  if (sanctions.summaryProcedure.unlimitedWarningReview !== true && sanctions.summaryProcedure.unlimitedWarningReview !== false) {
-    throw new Error('unlimitedWarningReviewは真偽値である必要があります。');
+  // 警察が単独で打てる処分と、必ず裁判所へ送る処分は重ならない。
+  if (sanctions.police.immediate.some((type) => sanctions.police.courtFirst.includes(type))) {
+    throw new Error('警察の即時処分と裁判所送りの処分は重複できません。');
+  }
+  if (typeof sanctions.police.unlimitedWarningContest !== 'boolean') {
+    throw new Error('unlimitedWarningContestは真偽値である必要があります。');
   }
 }
 
 function validateWorkflow(name, workflow) {
   exactKeys(workflow, ['initial', 'config', 'states'], `workflows.${name}`);
-  if (['law', 'constitutionalAmendment'].includes(name)) {
-    exactKeys(workflow.config, [
-      'maximumRevisions', 'extendOnLateMaterialFeedback', 'lateFeedbackWindow',
-      'debateExtension', 'maximumDebateExtensions'
-    ], `workflows.${name}.config`, ['suspensionRequired']);
-    if (workflow.config.suspensionRequired !== undefined) {
-      integer(workflow.config.suspensionRequired, `workflows.${name}.config.suspensionRequired`, { min: 1, max: 100 });
-    }
-    integer(workflow.config.maximumRevisions, `workflows.${name}.config.maximumRevisions`, { max: 20 });
-    integer(workflow.config.maximumDebateExtensions, `workflows.${name}.config.maximumDebateExtensions`, { max: 20 });
-    if (typeof workflow.config.extendOnLateMaterialFeedback !== 'boolean') {
-      throw new Error(`workflows.${name}.config.extendOnLateMaterialFeedback は真偽値である必要があります。`);
-    }
-    durationMilliseconds(workflow.config.lateFeedbackWindow, `workflows.${name}.config.lateFeedbackWindow`);
-    durationMilliseconds(workflow.config.debateExtension, `workflows.${name}.config.debateExtension`);
-  } else if (name === 'constitutionalCase') {
+  if (name === 'constitutionalCase') {
     exactKeys(workflow.config, ['petitionsPerMemberPerDay'], `workflows.${name}.config`);
     integer(workflow.config.petitionsPerMemberPerDay, `workflows.${name}.config.petitionsPerMemberPerDay`, { min: 1, max: 1000 });
   } else {
@@ -241,48 +230,13 @@ function validateWorkflow(name, workflow) {
     if (state.duration !== null) durationMilliseconds(state.duration, `workflows.${name}.states.${stateName}.duration`);
     object(state.config, `workflows.${name}.states.${stateName}.config`);
     object(state.on, `workflows.${name}.states.${stateName}.on`);
-    if (['public_discussion', 'public_vote', 'defense_window', 'appeal_window', 'objection_window', 'enactment_hold'].includes(state.handler)
+    if (['public_vote', 'defense_window', 'appeal_window'].includes(state.handler)
       && (state.duration === null || durationMilliseconds(state.duration) === 0)) {
       throw new Error(`${state.handler} には0より長い期間が必要です。`);
     }
-    // 異議が集まらないまま止まらないよう、両方の行き先を必ず持たせる。
-    if (state.handler === 'objection_window') {
-      exactKeys(state.config, ['required'], `workflows.${name}.states.${stateName}.config`, ['reflectionPanel']);
-      integer(state.config.required, `workflows.${name}.states.${stateName}.config.required`, { min: 1, max: 100 });
-      for (const outcome of ['finalized', 'revised']) {
-        if (!state.on[outcome]) throw new Error(`objection_window には ${outcome} の遷移が必要です。`);
-      }
-    }
-    // AI席が成立を決める段階。どの席で何票必要かは実行規則のpanelで決まる。
-    if (state.handler === 'council_decision') {
-      exactKeys(state.config, ['panel'], `workflows.${name}.states.${stateName}.config`);
-      for (const outcome of ['passed', 'rejected']) {
-        if (!state.on[outcome]) throw new Error(`council_decision には ${outcome} の遷移が必要です。`);
-      }
-    }
-    // 成立前に人間が止められる保留期間。必要数に達した異議で廃案にする。
-    if (state.handler === 'enactment_hold') {
-      exactKeys(state.config, ['required'], `workflows.${name}.states.${stateName}.config`);
-      integer(state.config.required, `workflows.${name}.states.${stateName}.config.required`, { min: 1, max: 100 });
-      for (const outcome of ['expired', 'vetoed']) {
-        if (!state.on[outcome]) throw new Error(`enactment_hold には ${outcome} の遷移が必要です。`);
-      }
-    }
-    if (state.handler === 'public_discussion') {
-      exactKeys(state.config, ['phase'], `workflows.${name}.states.${stateName}.config`, ['quietClose']);
-      if (!DISCUSSION_PHASES.includes(state.config.phase)) throw new Error('public_discussion.config.phase が不正です。');
-      // quietCloseを書かない討議は、意見がなくても期間を満了するまで開いたままになる。
-      if (state.config.quietClose !== undefined && state.config.quietClose !== null) {
-        const label = `workflows.${name}.states.${stateName}.config.quietClose`;
-        const quiet = durationMilliseconds(state.config.quietClose, label);
-        if (quiet === 0) throw new Error(`${label} には0より長い期間が必要です。`);
-        if (!QUIET_CLOSE_PHASES.includes(state.config.phase)) {
-          throw new Error('無風打ち切りは草案討議と再討議にだけ設定できます。');
-        }
-        if (quiet > durationMilliseconds(state.duration)) {
-          throw new Error('無風打ち切りの下限が討議期間を超えています。');
-        }
-      }
+    // 国会が動かすまでの待機なので、議題stateに固定の期間は置かない。
+    if (state.handler === 'parliament_agenda' && state.duration !== null) {
+      throw new Error(`workflows.${name}.states.${stateName}.duration は国会の議題では null である必要があります。`);
     }
     if (state.handler === 'terminal') {
       terminalCount += 1;
@@ -306,8 +260,8 @@ function validateWorkflow(name, workflow) {
   const unreachable = Object.keys(states).filter((state) => !reachable.has(state));
   if (unreachable.length) throw new Error(`workflows.${name} に到達不能状態があります: ${unreachable.join(', ')}`);
   const waitingHandlers = new Set([
-    'public_discussion', 'public_vote', 'defense_window', 'public_approval',
-    'review_window', 'appeal_window', 'objection_window', 'enactment_hold', 'terminal'
+    'parliament_agenda', 'public_vote', 'defense_window', 'public_approval',
+    'contest_window', 'appeal_window', 'terminal'
   ]);
   const instant = (stateName) => {
     const item = states[stateName];
@@ -330,127 +284,54 @@ function validateWorkflow(name, workflow) {
   if (Object.keys(states).some(findInstantCycle)) throw new Error(`workflows.${name} に待機を伴わない循環があります。`);
 }
 
-function requireTransition(workflow, stateName, outcome, targetHandler, targetPhase = null) {
+function requireTransition(workflow, stateName, outcome, targetHandler) {
   const state = workflow.states[stateName];
   const targetName = state?.on?.[outcome];
   const target = workflow.states[targetName];
-  if (!target || target.handler !== targetHandler
-    || (targetPhase !== null && target.config.phase !== targetPhase)) {
-    throw new Error(`workflow ${stateName}.${outcome} は ${targetHandler}${targetPhase ? `(${targetPhase})` : ''} へ進む必要があります。`);
+  if (!target || target.handler !== targetHandler) {
+    throw new Error(`workflow ${stateName}.${outcome} は ${targetHandler} へ進む必要があります。`);
   }
   return targetName;
 }
 
 function validateLegislativeWorkflow(name, workflow) {
-  const initialState = workflow.states[workflow.initial];
-  if (initialState?.handler !== 'draft') throw new Error(`workflows.${name}.initial は draft handlerである必要があります。`);
-  const publishedName = initialState.on.drafted;
-  const published = workflow.states[publishedName];
-  if (published?.handler !== 'public_discussion') throw new Error(`workflows.${name} は起草後に公開討議へ進む必要があります。`);
-  const phase = published.config.phase;
-  let constitutionalName;
-  if (phase === 'initial') {
-    const deliberationName = requireTransition(workflow, publishedName, 'expired', 'ai_deliberation');
-    requireTransition(workflow, publishedName, 'extended', 'public_discussion', 'initial');
-    const deliberation = workflow.states[deliberationName];
-    let revisionName;
-    if (deliberation.on.summarized) {
-      // 人間主導: AI整理は異議受付へ渡すだけで、調整するかどうかは異議の数が決める。
-      const objectionName = requireTransition(workflow, deliberationName, 'summarized', 'objection_window');
-      constitutionalName = requireTransition(workflow, deliberationName, 'uncontested', 'constitutional_panel');
-      revisionName = requireTransition(workflow, objectionName, 'revised', 'public_discussion', 'revision');
-      if (requireTransition(workflow, objectionName, 'finalized', 'constitutional_panel') !== constitutionalName) {
-        throw new Error(`workflows.${name} の異議受付は討議と同じ違憲審査へ進む必要があります。`);
-      }
-    } else {
-      revisionName = requireTransition(workflow, deliberationName, 'revised', 'public_discussion', 'revision');
-      constitutionalName = requireTransition(workflow, deliberationName, 'finalized', 'constitutional_panel');
-    }
-    requireTransition(workflow, deliberationName, 'remanded', 'terminal');
-    requireTransition(workflow, revisionName, 'expired', 'ai_deliberation');
-    requireTransition(workflow, revisionName, 'extended', 'public_discussion', 'revision');
-    if (workflow.states[revisionName].on.expired !== deliberationName) {
-      throw new Error(`workflows.${name} の初回討議と再討議は同じAI整理へ進む必要があります。`);
-    }
-    requireTransition(workflow, constitutionalName, 'revise', 'public_discussion', 'revision');
-  } else if (phase === 'legacy_draft') {
-    constitutionalName = requireTransition(workflow, publishedName, 'expired', 'constitutional_panel');
-    requireTransition(workflow, constitutionalName, 'revise', 'public_discussion', 'legacy_draft');
-  } else {
-    throw new Error(`workflows.${name} の最初の公開討議phaseが不正です。`);
+  const agendaName = workflow.initial;
+  const agenda = workflow.states[agendaName];
+  if (agenda?.handler !== 'parliament_agenda') {
+    throw new Error(`workflows.${name}.initial は parliament_agenda handlerである必要があります。`);
   }
-  requireTransition(workflow, constitutionalName, 'remanded', 'terminal');
-  const afterReviewName = workflow.states[constitutionalName].on.passed;
-  const afterReview = workflow.states[afterReviewName];
-  let decisionName = afterReviewName;
-  if (afterReview?.handler === 'public_discussion' && afterReview.config.phase === 'legacy_debate') {
-    decisionName = requireTransition(workflow, afterReviewName, 'expired', 'public_vote');
-  } else if (!['public_vote', 'council_decision'].includes(afterReview?.handler)) {
-    throw new Error(`workflows.${name} は違憲審査通過後に討議、公開投票またはAI席の成立判定へ進む必要があります。`);
+  exactKeys(agenda.on, ['adopted', 'deferred', 'rejected'], `workflows.${name}.states.${agendaName}.on`);
+  // 継続審議は同じ議題へ戻る。国会以外が議題を進める経路は作れない。
+  if (agenda.on.deferred !== agendaName) {
+    throw new Error(`workflows.${name} の継続審議は同じ議題へ戻る必要があります。`);
   }
-  const decision = workflow.states[decisionName];
-  requireTransition(workflow, decisionName, 'rejected', 'terminal');
-  if (decision.on.stale) requireTransition(workflow, decisionName, 'stale', 'terminal');
-  if (decision.handler === 'public_vote') {
-    requireTransition(workflow, decisionName, 'passed', 'terminal');
-    return;
-  }
-  // 人間の投票を持たない手続では、人間が止める手段を必ず1つ持たせる。
-  // 法律は施行後の停止、憲法は施行前の保留。施行済み憲法の巻き戻しは
-  // 既存の法律・判決との整合を壊すため、憲法側は事前にだけ止められる。
-  if (name === 'constitutionalAmendment') {
-    const holdName = requireTransition(workflow, decisionName, 'passed', 'enactment_hold');
-    requireTransition(workflow, holdName, 'expired', 'terminal');
-    requireTransition(workflow, holdName, 'vetoed', 'terminal');
-    return;
-  }
-  requireTransition(workflow, decisionName, 'passed', 'terminal');
-  if (!Number.isInteger(workflow.config.suspensionRequired) || workflow.config.suspensionRequired < 1) {
-    throw new Error(`workflows.${name} はAI席で成立させるため、施行後に停止できる必要数 (suspensionRequired) が必要です。`);
-  }
+  requireTransition(workflow, agendaName, 'rejected', 'terminal');
+  const voteName = requireTransition(workflow, agendaName, 'adopted', 'public_vote');
+  requireTransition(workflow, voteName, 'passed', 'terminal');
+  requireTransition(workflow, voteName, 'rejected', 'terminal');
+  if (workflow.states[voteName].on.stale) requireTransition(workflow, voteName, 'stale', 'terminal');
+  const agendaStates = Object.values(workflow.states).filter((state) => state.handler === 'parliament_agenda');
+  if (agendaStates.length !== 1) throw new Error(`workflows.${name} の議題stateは一つだけです。`);
 }
 
 export function validateGovernanceRules(input) {
-  const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'votes', 'sanctions', 'workflows'], 'governance-rules');
+  const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'parliament', 'votes', 'sanctions', 'workflows'], 'governance-rules');
   if (rules.$schema !== GOVERNANCE_RULES_SCHEMA) throw new Error('未対応のgovernance-rules schemaです。');
   validateElectorates(rules.electorates);
   validatePanels(rules.panels);
+  validateParliament(rules.parliament);
   validateVotes(rules.votes);
   validateSanctions(rules.sanctions);
   exactKeys(rules.workflows, ['law', 'constitutionalAmendment', 'criminalCase', 'constitutionalCase'], 'workflows');
   for (const [name, workflow] of Object.entries(rules.workflows)) validateWorkflow(name, workflow);
-  // 反映漏れ検査を宣言した段階は、必要票を持つpanelを指していなければならない。
-  for (const [name, workflow] of Object.entries(rules.workflows)) {
-    for (const [stateName, state] of Object.entries(workflow.states)) {
-      const panelName = state.config.reflectionPanel;
-      if (panelName === undefined || panelName === null) continue;
-      if (!Number.isInteger(rules.panels[panelName]?.required?.unreflected)) {
-        throw new Error(`workflows.${name}.${stateName}.config.reflectionPanel が参照するpanelがありません: ${panelName}`);
-      }
-    }
-  }
   validateLegislativeWorkflow('law', rules.workflows.law);
   validateLegislativeWorkflow('constitutionalAmendment', rules.workflows.constitutionalAmendment);
   for (const [workflowName, voteName] of [['law', 'law'], ['constitutionalAmendment', 'constitutionalAmendment']]) {
     const voteStates = Object.values(rules.workflows[workflowName].states)
       .filter((state) => state.handler === 'public_vote');
-    const councilStates = Object.values(rules.workflows[workflowName].states)
-      .filter((state) => state.handler === 'council_decision');
-    if (voteStates.length === 0 && councilStates.length === 1) continue;
-    if (councilStates.length > 1) throw new Error(`workflows.${workflowName} の成立判定は1つだけ置けます。`);
     if (voteStates.length !== 1 || voteStates[0].config.vote !== voteName
       || voteStates[0].duration !== rules.votes[voteName].duration) {
       throw new Error(`workflows.${workflowName} の投票段階は votes.${voteName} と一致する必要があります。`);
-    }
-  }
-  // 成立判定と反映漏れ検査が指すpanelは、必要票を持って存在しなければならない。
-  for (const [name, workflow] of Object.entries(rules.workflows)) {
-    for (const [stateName, state] of Object.entries(workflow.states)) {
-      if (state.handler !== 'council_decision') continue;
-      const panel = rules.panels[state.config.panel];
-      if (!Number.isInteger(panel?.required?.enact) || !Number.isInteger(panel?.required?.adopt)) {
-        throw new Error(`workflows.${name}.${stateName}.config.panel が参照するpanelがありません: ${state.config.panel}`);
-      }
     }
   }
   return rules;
@@ -468,183 +349,16 @@ export function extractGovernanceRules(content) {
   return validateGovernanceRules(parsed);
 }
 
-function state(handler, duration = null, config = {}, on = {}) {
-  return { handler, duration, config, on };
-}
-
-export function rulesFromLegacyPolicy(input) {
-  const policy = validateConstitutionPolicy(structuredClone(input));
-  const modern = Number.isInteger(policy.legislation.initialDebateMilliseconds);
-  const initialDebate = modern ? policy.legislation.initialDebateMilliseconds : policy.legislation.draftMilliseconds;
-  const revisionDebate = modern ? policy.legislation.revisionDebateMilliseconds : policy.legislation.debateMilliseconds;
-  const voteDuration = policy.legislation.voteMilliseconds;
-  const summary = policy.schemaVersion === 2 ? policy.judiciary.summaryProcedure : {
-    panelSeats: policy.judiciary.panelSeats,
-    votesRequired: policy.judiciary.guiltyVotesRequired,
-    trialMilliseconds: policy.judiciary.defenseMilliseconds,
-    immediateSanctions: [],
-    trialFirstSanctions: policy.judiciary.allowedSanctions,
-    unlimitedWarningReview: false
-  };
-  const lawStates = modern ? {
-    drafting: state('draft', null, {}, { drafted: 'discussion' }),
-    discussion: state('public_discussion', durationText(initialDebate), { phase: 'initial' }, { expired: 'deliberation', extended: 'discussion' }),
-    deliberation: state('ai_deliberation', null, {}, { revised: 'revision_discussion', finalized: 'constitutional_review', remanded: 'remanded' }),
-    revision_discussion: state('public_discussion', durationText(revisionDebate), { phase: 'revision' }, { expired: 'deliberation', extended: 'revision_discussion' }),
-    constitutional_review: state('constitutional_panel', null, { panel: 'constitutional' }, { passed: 'voting', revise: 'revision_discussion', remanded: 'remanded' }),
-    voting: state('public_vote', durationText(voteDuration), { vote: 'law' }, { passed: 'enacted', rejected: 'rejected', stale: 'remanded' }),
-    enacted: state('terminal'), rejected: state('terminal'), remanded: state('terminal')
-  } : {
-    drafting: state('draft', null, {}, { drafted: 'draft' }),
-    draft: state('public_discussion', durationText(initialDebate), { phase: 'legacy_draft' }, { expired: 'constitutional_review' }),
-    constitutional_review: state('constitutional_panel', null, { panel: 'constitutional' }, { passed: 'debate', revise: 'draft', remanded: 'remanded' }),
-    debate: state('public_discussion', durationText(revisionDebate), { phase: 'legacy_debate' }, { expired: 'voting' }),
-    voting: state('public_vote', durationText(voteDuration), { vote: 'law' }, { passed: 'enacted', rejected: 'rejected', stale: 'remanded' }),
-    enacted: state('terminal'), rejected: state('terminal'), remanded: state('terminal')
-  };
-  const amendmentStates = structuredClone(lawStates);
-  if (amendmentStates.voting) amendmentStates.voting.config.vote = 'constitutionalAmendment';
-  const criminalStates = {
-    defense: state('defense_window', durationText(policy.judiciary.defenseMilliseconds), {}, { completed: 'deliberation', expired: 'deliberation' }),
-    deliberation: state('judicial_panel', null, { panel: 'criminal' }, { responsible: 'approval', no_case: 'final', appealable: 'appeal_window', executable: 'execution' }),
-    approval: state('public_approval', null, {}, { approved: 'appeal_window', rejected: 'final' }),
-    appeal_window: state('appeal_window', durationText(policy.judiciary.appealMilliseconds), {}, { appealed: 'appeal', expired: 'execution' }),
-    appeal: state('judicial_panel', null, { panel: 'criminal' }, { responsible: 'approval', no_case: 'final', executable: 'execution' }),
-    execution: state('sanction_execution', null, {}, { executed: 'final', unavailable: 'final', failed: 'final' }),
-    final: state('terminal')
-  };
-  if (policy.schemaVersion === 2) {
-    criminalStates.summary_review = state('summary_review', null, { panel: 'summary' }, { no_case: 'final', immediate: 'review_window', trial_first: 'defense' });
-    criminalStates.review_window = state('review_window', null, {}, { review_requested: 'defense', expired: 'final' });
-  } else {
-    criminalStates.filing = state('draft', null, {}, { filed: 'defense' });
-  }
-  return validateGovernanceRules({
-    $schema: GOVERNANCE_RULES_SCHEMA,
-    electorates: {
-      general: {
-        type: 'activity',
-        memberAge: durationText(policy.eligibility.memberAgeDays * 86_400_000),
-        window: durationText(policy.eligibility.windowDays * 86_400_000),
-        minimumMessages: policy.eligibility.minimumMessages,
-        minimumActiveDays: policy.eligibility.minimumActiveDays,
-        perDayCap: policy.eligibility.perDayCap,
-        minimumVisibleCharacters: policy.eligibility.minimumVisibleCharacters,
-        timezoneOffsetMinutes: policy.timezoneOffsetMinutes
-      },
-      trusted: { type: 'discord_role', binding: 'trusted' }
-    },
-    panels: {
-      proposalRelation: { seats: 3, required: { decision: 2 } },
-      constitutional: {
-        seats: policy.judiciary.panelSeats,
-        required: {
-          constitutional: policy.judiciary.constitutionalVotesRequired,
-          unconstitutional: policy.judiciary.unconstitutionalVotesRequired
-        }
-      },
-      criminal: { seats: policy.judiciary.panelSeats, required: { responsible: policy.judiciary.guiltyVotesRequired } },
-      summary: { seats: summary.panelSeats, required: { responsible: summary.votesRequired } }
-    },
-    votes: {
-      defaultScope: policy.voting.defaultScope,
-      allowedScopes: policy.voting.allowedScopes,
-      law: {
-        duration: durationText(voteDuration), yesRatio: policy.voting.lawYesRatio, comparison: 'gt',
-        quorumRatio: policy.voting.quorumRatio, minimumBallots: policy.voting.minimumBallots,
-        publicBallots: policy.voting.publicBallots,
-        trustedVeto: { enabledForScope: 'all', noRatio: policy.voting.trustedVetoRatio, denominator: 'decisive_cast_ballots' }
-      },
-      constitutionalAmendment: {
-        duration: durationText(voteDuration), yesRatio: policy.voting.amendmentYesRatio, comparison: 'gte',
-        quorumRatio: policy.voting.quorumRatio, minimumBallots: policy.voting.minimumBallots,
-        publicBallots: policy.voting.publicBallots,
-        trustedVeto: { enabledForScope: 'all', noRatio: policy.voting.trustedVetoRatio, denominator: 'decisive_cast_ballots' }
-      }
-    },
-    sanctions: {
-      allowed: policy.judiciary.allowedSanctions,
-      restrictionPrimitives: policy.judiciary.restrictionPrimitives,
-      maximumRestriction: durationText(policy.judiciary.maximumRestrictionSeconds * 1000),
-      timeout: {
-        discordMaximum: durationText(policy.judiciary.discordMaximumTimeoutSeconds * 1000),
-        maximum: durationText(policy.judiciary.maximumTimeoutSeconds * 1000),
-        immediateMaximum: durationText(policy.judiciary.immediateTimeoutMaximumSeconds * 1000)
-      },
-      approvals: {
-        timeoutAboveImmediate: policy.judiciary.timeoutApprovalsAboveSeconds,
-        kick: policy.judiciary.kickApprovals,
-        ban: policy.judiciary.banApprovals
-      },
-      appeals: {
-        timeoutAtLeast: durationText(policy.judiciary.appealTimeoutMinimumSeconds * 1000),
-        types: ['ban', 'timeout'],
-        duration: durationText(policy.judiciary.appealMilliseconds)
-      },
-      summaryProcedure: {
-        trialDuration: durationText(summary.trialMilliseconds),
-        immediate: summary.immediateSanctions,
-        trialFirst: summary.trialFirstSanctions,
-        unlimitedWarningReview: summary.unlimitedWarningReview
-      }
-    },
-    workflows: {
-      law: {
-        initial: 'drafting',
-        config: {
-          maximumRevisions: modern ? policy.legislation.maximumRevisions : 2,
-          extendOnLateMaterialFeedback: modern ? policy.legislation.extendOnLateMaterialFeedback : true,
-          lateFeedbackWindow: durationText(modern ? policy.legislation.lateFeedbackWindowMilliseconds : 10_800_000),
-          debateExtension: durationText(modern ? policy.legislation.debateExtensionMilliseconds : 21_600_000),
-          maximumDebateExtensions: modern ? policy.legislation.maximumDebateExtensions : 1
-        },
-        states: lawStates
-      },
-      constitutionalAmendment: {
-        initial: 'drafting',
-        config: {
-          maximumRevisions: modern ? policy.legislation.maximumRevisions : 2,
-          extendOnLateMaterialFeedback: modern ? policy.legislation.extendOnLateMaterialFeedback : true,
-          lateFeedbackWindow: durationText(modern ? policy.legislation.lateFeedbackWindowMilliseconds : 10_800_000),
-          debateExtension: durationText(modern ? policy.legislation.debateExtensionMilliseconds : 21_600_000),
-          maximumDebateExtensions: modern ? policy.legislation.maximumDebateExtensions : 1
-        },
-        states: amendmentStates
-      },
-      criminalCase: {
-        initial: policy.schemaVersion === 2 ? 'summary_review' : 'filing', config: {}, states: criminalStates
-      },
-      constitutionalCase: {
-        initial: 'defense', config: { petitionsPerMemberPerDay: policy.judiciary.constitutionalChallengesPerMemberPerDay }, states: {
-          defense: state('defense_window', durationText(policy.judiciary.defenseMilliseconds), {}, { completed: 'deliberation', expired: 'deliberation' }),
-          deliberation: state('constitutional_panel', null, { panel: 'constitutional' }, { constitutional: 'final', unconstitutional: 'final', insufficient: 'final' }),
-          final: state('terminal')
-        }
-      }
-    }
-  });
-}
-
-function workflowStateByHandler(workflow, handler, predicate = () => true) {
-  return Object.values(workflow.states).find((state) => state.handler === handler && predicate(state));
-}
-
 export function policyFromGovernanceRules(input) {
   const rules = validateGovernanceRules(structuredClone(input));
   const general = rules.electorates.general;
-  const lawFlow = rules.workflows.law;
-  const initial = workflowStateByHandler(lawFlow, 'public_discussion', (state) => state.config.phase === 'initial');
-  const revision = workflowStateByHandler(lawFlow, 'public_discussion', (state) => state.config.phase === 'revision');
-  const legacyDraft = workflowStateByHandler(lawFlow, 'public_discussion', (state) => state.config.phase === 'legacy_draft');
-  const legacyDebate = workflowStateByHandler(lawFlow, 'public_discussion', (state) => state.config.phase === 'legacy_debate');
   const vote = rules.votes.law;
   const constitutional = rules.panels.constitutional;
-  const criminal = rules.panels.criminal;
-  const summary = rules.panels.summary;
+  const court = rules.panels.court;
+  const police = rules.panels.police;
   const sanctions = rules.sanctions;
-  const modern = Boolean(initial && revision);
   const summaryWorkflow = Object.values(rules.workflows.criminalCase.states)
-    .some((state) => state.handler === 'summary_review');
+    .some((state) => state.handler === 'police_review');
   const policy = {
     schemaVersion: summaryWorkflow ? 2 : 1,
     timezoneOffsetMinutes: general.timezoneOffsetMinutes,
@@ -666,26 +380,19 @@ export function policyFromGovernanceRules(input) {
       minimumBallots: vote.minimumBallots,
       publicBallots: vote.publicBallots
     },
-    legislation: modern ? {
-      initialDebateMilliseconds: durationMilliseconds(initial.duration),
-      revisionDebateMilliseconds: durationMilliseconds(revision.duration),
+    legislation: {
       voteMilliseconds: durationMilliseconds(vote.duration),
-      maximumRevisions: lawFlow.config.maximumRevisions,
-      extendOnLateMaterialFeedback: lawFlow.config.extendOnLateMaterialFeedback,
-      lateFeedbackWindowMilliseconds: durationMilliseconds(lawFlow.config.lateFeedbackWindow),
-      debateExtensionMilliseconds: durationMilliseconds(lawFlow.config.debateExtension),
-      maximumDebateExtensions: lawFlow.config.maximumDebateExtensions
-    } : {
-      draftMilliseconds: durationMilliseconds(legacyDraft.duration),
-      debateMilliseconds: durationMilliseconds(legacyDebate.duration),
-      voteMilliseconds: durationMilliseconds(vote.duration)
+      sessionIntervalMilliseconds: durationMilliseconds(rules.parliament.sessionInterval),
+      agendaLimit: rules.parliament.agendaLimit,
+      maximumDeferrals: rules.parliament.maximumDeferrals,
+      logScan: rules.parliament.logScan
     },
     judiciary: {
       defenseMilliseconds: durationMilliseconds(rules.workflows.criminalCase.states.defense?.duration ?? rules.workflows.constitutionalCase.states.defense.duration),
       appealMilliseconds: durationMilliseconds(sanctions.appeals.duration),
       constitutionalChallengesPerMemberPerDay: rules.workflows.constitutionalCase.config.petitionsPerMemberPerDay,
-      panelSeats: criminal.seats,
-      guiltyVotesRequired: criminal.required.responsible,
+      panelSeats: court.seats,
+      guiltyVotesRequired: court.required.responsible,
       constitutionalVotesRequired: constitutional.required.constitutional,
       unconstitutionalVotesRequired: constitutional.required.unconstitutional,
       discordMaximumTimeoutSeconds: durationMilliseconds(sanctions.timeout.discordMaximum) / 1000,
@@ -701,25 +408,26 @@ export function policyFromGovernanceRules(input) {
     }
   };
   if (policy.schemaVersion === 2) {
-    policy.judiciary.summaryProcedure = {
-      panelSeats: summary.seats,
-      votesRequired: summary.required.responsible,
-      trialMilliseconds: durationMilliseconds(sanctions.summaryProcedure.trialDuration),
-      immediateSanctions: sanctions.summaryProcedure.immediate,
-      trialFirstSanctions: sanctions.summaryProcedure.trialFirst,
-      unlimitedWarningReview: sanctions.summaryProcedure.unlimitedWarningReview
+    policy.judiciary.policeProcedure = {
+      panelSeats: police.seats,
+      votesRequired: police.required.responsible,
+      contestMilliseconds: durationMilliseconds(sanctions.police.contestDuration),
+      detentionMaximumSeconds: durationMilliseconds(sanctions.detention.maximum) / 1000,
+      immediateSanctions: sanctions.police.immediate,
+      courtFirstSanctions: sanctions.police.courtFirst,
+      unlimitedWarningContest: sanctions.police.unlimitedWarningContest
     };
   }
   return validateConstitutionPolicy(policy, { technicalOnly: true });
 }
 
-export function compileConstitution({ content, policy = null }) {
-  const embedded = extractGovernanceRules(content);
-  const rules = embedded ?? rulesFromLegacyPolicy(policy);
-  const projectedPolicy = embedded ? policyFromGovernanceRules(rules) : validateConstitutionPolicy(structuredClone(policy));
+export function compileConstitution({ content }) {
+  const rules = extractGovernanceRules(content);
+  if (!rules) throw new Error('憲法にgovernance-rulesブロックがありません。');
+  const projectedPolicy = policyFromGovernanceRules(rules);
   const canonical = canonicalJson(rules);
   return {
-    sourceFormat: embedded ? 'embedded-rules-v1' : 'legacy-policy',
+    sourceFormat: 'embedded-rules-v1',
     compilerVersion: GOVERNANCE_RULES_COMPILER_VERSION,
     rules,
     rulesHash: sha256(canonical),
@@ -769,31 +477,18 @@ export function closeGovernanceVote({ kind, yes, no, abstain, electorate, truste
 }
 
 export function governanceRulesSummary(rules) {
-  const law = rules.workflows.law;
-  const initial = workflowStateByHandler(law, 'public_discussion', (state) => state.config.phase === 'initial');
-  const revision = workflowStateByHandler(law, 'public_discussion', (state) => state.config.phase === 'revision');
   const lines = [];
-  if (initial) lines.push(`草案討議 ${initial.duration}${initial.config.quietClose ? ` (無風は${initial.config.quietClose}で打ち切り)` : ''}`);
-  if (revision) lines.push(`実質変更後の再討議 ${revision.duration}${revision.config.quietClose ? ` (無風は${revision.config.quietClose}で打ち切り)` : ''}`);
-  const objection = workflowStateByHandler(law, 'objection_window');
-  if (objection) lines.push(`調整に必要な異議 ${objection.config.required}件`);
-  const council = workflowStateByHandler(law, 'council_decision');
-  if (council) {
-    const panel = rules.panels[council.config.panel];
-    lines.push(`成立判定 ${panel.seats}席 (必要 ${panel.required.enact}席)`);
-    if (Number.isInteger(law.config.suspensionRequired)) {
-      lines.push(`施行後の停止 ${law.config.suspensionRequired}人`);
-    }
-    const hold = workflowStateByHandler(rules.workflows.constitutionalAmendment, 'enactment_hold');
-    if (hold) lines.push(`改憲の保留 ${hold.duration} / 異議 ${hold.config.required}人`);
-  } else {
-    lines.push(`法律投票 ${rules.votes.law.duration}`);
-    lines.push(`憲法改正投票 ${rules.votes.constitutionalAmendment.duration}`);
-    if (rules.votes.law.earlyClose === 'all_ballots_cast' || rules.votes.constitutionalAmendment.earlyClose === 'all_ballots_cast') {
-      lines.push('有権者全員の投票で即時開票');
-    }
+  lines.push(`国会 ${rules.parliament.sessionInterval}ごと / 1回 ${rules.parliament.agendaLimit}議題`);
+  lines.push(`継続審議 ${rules.parliament.maximumDeferrals}回まで`);
+  lines.push(`公開記録からの議題発見 ${rules.parliament.logScan ? 'あり' : 'なし'}`);
+  lines.push(`法律投票 ${rules.votes.law.duration}`);
+  lines.push(`憲法改正投票 ${rules.votes.constitutionalAmendment.duration}`);
+  if (rules.votes.law.earlyClose === 'all_ballots_cast' || rules.votes.constitutionalAmendment.earlyClose === 'all_ballots_cast') {
+    lines.push('有権者全員の投票で即時開票');
   }
+  lines.push(`警察 ${rules.panels.police.seats}席 / 裁判所 ${rules.panels.court.seats}席`);
+  lines.push(`拘留 最大${rules.sanctions.detention.maximum}`);
   lines.push(`違憲審査 ${rules.panels.constitutional.seats}席`);
-  lines.push(`類似案件判定 ${rules.panels.proposalRelation.seats}席`);
+  lines.push(`国会の合議 ${rules.panels.parliament.seats}席`);
   return lines.join(' / ');
 }

@@ -11,37 +11,35 @@ import {
   createAdministrativeAct,
   createAppeal,
   createCase,
-  createInterimProtection,
-  createProposal,
+  createDetention,
   createSanction,
   deactivateRestrictionForSanction,
   enactConstitution,
   enactLaw,
   enqueueAction,
+  expireDetentions,
   expireRestrictions,
-  expireInterimProtections,
   expireGovernanceIntakes,
   failAction,
-  findActiveProposalByNormalizedTitle,
-  findCaseBySummaryEvent,
+  findCaseByPoliceEvent,
   findOpenConstitutionalCase,
-  findRecentSummaryCase,
+  findRecentPoliceCase,
   getActiveConstitution,
   getAdministrativeAct,
   getAppeal,
   getCase,
   getCaseByPublicThread,
+  getCaseDetention,
   getCaseSanction,
   getGovernanceGuild,
-  getCaseInterimProtection,
   getConstitution,
   getLaw,
-  getMentionInvestigation,
   getCurrentLawVersion,
   getOperationalSetting,
   getProposal,
-  getProposalByForumThread,
+  detainedSeconds,
   getSanction,
+  releaseDetention,
   getSanctionDefinition,
   listCaseApprovals,
   listCaseEvidence,
@@ -51,36 +49,19 @@ import {
   listCases,
   listGovernanceGuilds,
   listLaws,
-  listInvestigationEvidence,
   listOpenCasesForLaw,
-  listProposalDeliberations,
-  listProposalObjections,
   listProposals,
   listSanctionsForLaw,
   markActionRunning,
   markEvidenceDisclosed,
   pendingActions,
   proposalVoteSummary,
-  proposalDiscussion,
   pruneGovernance,
-  queueProposalWorkflow,
   recordActivities,
   recordActivity,
-  recordProposalDeliberation,
-  recordProposalObjection,
-  recordParliamentOpinion,
-  recordLawSuspension,
-  createParliamentSession,
-  closeParliamentSession,
-  listParliamentOpinions,
-  settleParliamentOpinion,
-  listLawSuspensions,
-  recordInstrumentRelation,
   recentUserActivity,
-  recentGovernanceMessages,
   replaceCaseSubmission,
   reserveAgentAttempt,
-  resumeQueuedProposal,
   setCaseApproval,
   setOperationalSetting,
   snapshotProposalVoters,
@@ -94,40 +75,23 @@ import {
   writeAudit
 } from './db.js';
 import {
+  postEnforcementRecord,
   applyAppealRestriction,
   createCourtCaseThread,
-  createParliamentRecordThread,
-  createProposalPost,
-  enactmentHoldButtons,
   executeDiscordSanction,
   ensureGovernanceParliamentForum,
-  ensureGovernanceStatuteForum,
   postAuthorityChange,
   postCourtUpdate,
   postCourtRecord,
   postProposalUpdate,
-  objectionButtons,
   publicMemberLabel,
   releaseAppealRestriction,
-  reviewRequestButtons,
+  contestButtons,
   syncAppealRoleOverwrites,
   ensureGovernanceMentionRoles,
-  syncGovernanceRecordUi,
-  syncStatuteBook
+  syncGovernanceRecordUi
 } from './discord.js';
 import {
-  discoverWeeklyIssues,
-  decideEnactment,
-  deliberateProposal,
-  reviewDebateReflection,
-  sustainedReflectionPoints,
-  reviewSuspendedLaw,
-  screenParliamentOpinions,
-  draftAmendment,
-  draftBill,
-  draftProposalRevision,
-  summarizeProposalDebate,
-  reviewLegislativeRelation,
   runConstitutionalPanel,
   runJudicialPanel
 } from './llm.js';
@@ -135,24 +99,17 @@ import {
   DAY_MS,
   activityDate,
   isAppealable,
-  legislationProcedure,
   normalizeActivityContent,
   requiredApprovals,
   sha256,
-  summaryProcedure,
+  policeProcedure,
   validateAutomaticTrigger,
-  validateInterimProtectionDefinition,
   validateRestrictionDefinition
 } from './policy.js';
 import { governanceActionAllowed, reserveRestrictedAgentCall } from './restrictions.js';
 import { notifyCaseParty } from './notifications.js';
-import {
-  activeProposal,
-  activeConstitutionalAmendment,
-  activeLawAmendment,
-  buildLegislativeCandidates,
-  exactActiveProposalMatch
-} from './relation.js';
+import { publishInstrument, syncLawSite } from './lawsite.js';
+
 import { closeGovernanceVote, compileConstitution, durationMilliseconds, workflowFor } from './rules.js';
 
 const RETRY_BASE_MS = 5 * 60_000;
@@ -241,7 +198,7 @@ function acceptedWorkflowError(message, resultType, resultId) {
   return error;
 }
 
-function retryPatch(record, error, now = Date.now()) {
+export function retryPatch(record, error, now = Date.now()) {
   const failureCount = Number(record.failure_count ?? 0) + 1;
   return {
     failure_count: failureCount,
@@ -265,7 +222,7 @@ function constitutionForCase(caseRecord) {
 }
 
 function caseProcedure(caseRecord) {
-  return summaryProcedure(constitutionForCase(caseRecord)?.policy);
+  return policeProcedure(constitutionForCase(caseRecord)?.policy);
 }
 
 function governanceSurface(channel, governance) {
@@ -275,7 +232,6 @@ function governanceSurface(channel, governance) {
     governance.parliament_forum_id,
     governance.court_forum_id,
     governance.court_chat_channel_id,
-    governance.statute_forum_id,
     governance.procedure_channel_id,
     governance.operations_thread_id
   ].filter(Boolean));
@@ -285,10 +241,10 @@ function governanceSurface(channel, governance) {
 function publicChannel(message, governance = null) {
   const channel = message.channel;
   if (!channel || channel.isDMBased?.()) return false;
-  const isProposalDiscussion = channel.isThread?.()
-    && channel.parentId === governance?.parliament_forum_id
-    && Boolean(getProposalByForumThread(channel.id));
-  if (governanceSurface(channel, governance) && (!isProposalDiscussion || message.author?.bot)) return false;
+  // 議会Forumのスレは議題そのもの。proposal行になる前の討論も国会が読めるよう記録する。
+  const isAgendaDiscussion = channel.isThread?.()
+    && channel.parentId === governance?.parliament_forum_id;
+  if (governanceSurface(channel, governance) && (!isAgendaDiscussion || message.author?.bot)) return false;
   const everyone = message.guild?.roles?.everyone;
   return Boolean(everyone && channel.permissionsFor?.(everyone)?.has(PermissionFlagsBits.ViewChannel));
 }
@@ -428,901 +384,9 @@ export async function buildElectorateSnapshot(guild, proposalId) {
   return rows;
 }
 
-async function finishDraft(guild, proposal, body) {
+export async function openProposalVote(guild, proposal, outcome = 'adopted') {
   const { governance } = requireGovernance(guild.id);
-  const now = Date.now();
-  const transition = proposalTransition(proposal, 'drafted');
-  const stageEndsAt = proposalStageEnd(transition, now);
-  const nextStatus = transition.targetName;
-  // Forum作成が成功するまではdraftingのままにする。bodyは保存済みなので、
-  // Discord障害からの再試行でAIをもう一度呼ぶ必要はない。
-  proposal = updateProposal(proposal.id, {
-    title: body.title,
-    summary: body.summary,
-    body,
-    retry_after: null,
-    failure_count: 0,
-    last_error: null
-  });
-  const displayProposal = {
-    ...proposal,
-    status: nextStatus,
-    stage_started_at: now,
-    stage_ends_at: stageEndsAt
-  };
-  const post = proposal.forum_thread_id
-    ? { threadId: proposal.forum_thread_id, messageId: proposal.forum_message_id }
-    : await createProposalPost(guild, governance, displayProposal);
-  return updateProposal(proposal.id, {
-    status: nextStatus,
-    stage_started_at: now,
-    stage_ends_at: stageEndsAt,
-    debate_extensions: 0,
-    forum_thread_id: post.threadId,
-    forum_message_id: post.messageId
-  });
-}
-
-async function draftStoredProposal(guild, proposal, { relatedInputs = null } = {}) {
-  const { constitution, policy } = requireGovernance(guild.id);
-  if (proposal.body) return finishDraft(guild, proposal, proposal.body);
-  const inputs = relatedInputs ?? (Array.isArray(proposal.workflow_context?.queue?.inputs)
-    ? proposal.workflow_context.queue.inputs
-    : []);
-  const investigationId = /^mention_investigation:(\d+)$/.exec(String(proposal.source))?.[1] ?? null;
-  const investigation = investigationId ? getMentionInvestigation(investigationId) : null;
-  const investigationEvidence = investigationId
-    ? listInvestigationEvidence(investigationId, 'legislative_basis')
-    : [];
-  const request = {
-    title: proposal.title,
-    summary: [
-      proposal.summary,
-      ...inputs.slice(-8).map((input) => `同一案件として寄せられた意見: ${String(input.summary ?? '').slice(0, 1200)}`)
-    ].join('\n').slice(0, 12_000),
-    source: proposal.source,
-    investigation: investigation ? {
-      id: investigation.id,
-      request: investigation.request_text,
-      evidence: investigationEvidence.map((entry) => ({
-        messageId: entry.message_id,
-        authorId: entry.author_id,
-        content: entry.content,
-        occurredAt: entry.occurred_at
-      }))
-    } : null
-  };
-  const targetLaw = proposal.target_type === 'law' ? getLaw(proposal.target_id) : null;
-  const body = proposal.kind === 'amendment'
-    ? await draftAmendment({ guildId: guild.id, request, constitution })
-    : await draftBill({
-      guildId: guild.id,
-      petition: targetLaw ? {
-        ...request,
-        amendmentTarget: {
-          id: targetLaw.id,
-          title: targetLaw.title,
-          text: targetLaw.text,
-          provisions: targetLaw.provisions,
-          contentHash: targetLaw.content_hash,
-          instruction: 'Return the complete replacement law. Preserve every unrelated provision exactly.'
-        }
-      } : request,
-      constitution,
-      activeLaws: listLaws(guild.id),
-      policy
-    });
-  return finishDraft(guild, proposal, body);
-}
-
-export async function filePetition(guild, member, {
-  title, summary, source = 'petition', eventId = null, voteScope = null,
-  attemptReserved = false, relation = null
-}) {
-  const { governance, constitution, policy } = requireGovernance(guild.id);
-  const scope = voteScope ?? policy.voting.defaultScope;
-  if (!policy.voting.allowedScopes.includes(scope)) throw new Error('許可されていない投票scopeです。');
-  if (scope === 'trusted' && !governance.trusted_role_id) throw new Error('特別有権者のみの投票には、対象ロールの設定が必要です。');
-  if (!governanceActionAllowed(guild.id, member.id, 'petition')) throw new Error('請願提出が制裁により停止されています。');
-  const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
-  if (duplicate) throw new Error('同名の法案が進行中です。議会で討議してください。');
-  const officialSource = source === 'weekly' || String(source).startsWith('mention_investigation:');
-  if (!officialSource && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `petition:${member.id}:${Date.now()}`);
-  let targetLaw = null;
-  let targetConflict = null;
-  if (relation?.relation === 'amend_law') {
-    targetLaw = getCurrentLawVersion(relation.targetId);
-    if (!targetLaw || targetLaw.guild_id !== guild.id || targetLaw.status !== 'active') throw new Error('改正対象の法律が現行ではありません。');
-    if (relation.targetHash && relation.targetHash !== targetLaw.content_hash) throw new Error('改正対象の法律が更新されました。改めて内容を確認してください。');
-    targetConflict = activeLawAmendment(
-      listProposals(guild.id, { limit: 500 }),
-      listLaws(guild.id, { activeOnly: false, limit: 500 }),
-      targetLaw.id
-    );
-  }
-  let proposal = createProposal({
-    guildId: guild.id,
-    kind: 'law',
-    source,
-    title,
-    summary,
-    proposerId: officialSource ? null : member.id,
-    constitutionId: constitution.id,
-    voteScope: scope,
-    status: workflowFor({ rules: constitution.rules }, 'law').initial,
-    relationType: relation?.relation ?? 'new',
-    targetType: targetLaw ? 'law' : null,
-    targetId: targetLaw?.id ?? null,
-    targetHash: targetLaw?.content_hash ?? null
-  });
-  if (relation && relation.relation !== 'new') recordInstrumentRelation({
-    guildId: guild.id,
-    sourceType: 'proposal',
-    sourceId: proposal.id,
-    relationType: relation.relation,
-    targetType: relation.targetType ?? 'none',
-    targetId: relation.targetId ?? 'none',
-    targetHash: relation.targetHash,
-    reasons: relation.reasons,
-    decision: relation
-  });
-  if (targetConflict) {
-    return queueProposalWorkflow(proposal.id, {
-      blockedByProposalId: targetConflict.id,
-      reason: 'same_law_in_progress'
-    });
-  }
-  try {
-    return await draftStoredProposal(guild, proposal);
-  } catch (error) {
-    updateProposal(proposal.id, retryPatch(proposal, error));
-    console.error(`Initial draft failed for proposal ${proposal.id}:`, error);
-    throw acceptedWorkflowError(
-      '法案を受理しました。準備ができると議会に表示されます。',
-      'proposal',
-      proposal.id
-    );
-  }
-}
-
-export async function fileAmendment(guild, member, {
-  title, summary, eventId = null, voteScope = null, attemptReserved = false, relation = null,
-  source = 'petition'
-}) {
-  const { governance, constitution, policy } = requireGovernance(guild.id);
-  const scope = voteScope ?? policy.voting.defaultScope;
-  if (!policy.voting.allowedScopes.includes(scope)) throw new Error('許可されていない投票scopeです。');
-  if (scope === 'trusted' && !governance.trusted_role_id) throw new Error('特別有権者のみの投票には、対象ロールの設定が必要です。');
-  if (!governanceActionAllowed(guild.id, member.id, 'petition')) throw new Error('改憲提案が制裁により停止されています。');
-  const conflict = activeConstitutionalAmendment(
-    listProposals(guild.id, { limit: 500 })
-  );
-  const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
-  if (duplicate) throw new Error('同名の改憲案が進行中です。議会で討議してください。');
-  const officialSource = String(source).startsWith('mention_investigation:');
-  if (!officialSource && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `amendment:${member.id}:${Date.now()}`);
-  let proposal = createProposal({
-    guildId: guild.id,
-    kind: 'amendment',
-    source,
-    title,
-    summary,
-    proposerId: officialSource ? null : member.id,
-    constitutionId: constitution.id,
-    voteScope: scope,
-    status: workflowFor({ rules: constitution.rules }, 'constitutionalAmendment').initial,
-    relationType: relation?.relation ?? 'amend_constitution',
-    targetType: 'constitution',
-    targetId: constitution.id,
-    targetHash: constitution.content_hash
-  });
-  if (relation) recordInstrumentRelation({
-    guildId: guild.id,
-    sourceType: 'proposal',
-    sourceId: proposal.id,
-    relationType: relation.relation,
-    targetType: relation.targetType ?? 'constitution',
-    targetId: relation.targetId ?? constitution.id,
-    targetHash: relation.targetHash ?? constitution.content_hash,
-    reasons: relation.reasons,
-    decision: relation
-  });
-  if (conflict) {
-    return queueProposalWorkflow(proposal.id, {
-      blockedByProposalId: conflict.id,
-      reason: 'constitution_in_progress'
-    });
-  }
-  try {
-    return await draftStoredProposal(guild, proposal);
-  } catch (error) {
-    updateProposal(proposal.id, retryPatch(proposal, error));
-    console.error(`Initial draft failed for amendment ${proposal.id}:`, error);
-    throw acceptedWorkflowError(
-      '改憲案を受理しました。準備ができると議会に表示されます。',
-      'proposal',
-      proposal.id
-    );
-  }
-}
-
-async function reviseProposal(guild, proposal, reviews) {
-  const runtime = proposalRuntime(proposal);
-  const constitution = runtime.constitution;
-  const maximumRevisions = runtime.workflow.config.maximumRevisions ?? 2;
-  if (proposal.revision - 1 >= maximumRevisions) {
-    const transition = proposalTransition(proposal, 'remanded');
-    const remanded = { ...proposal, status: transition.targetName, stage_ends_at: Date.now() };
-    await postProposalUpdate(
-      guild,
-      remanded,
-      `違憲審査の指摘を反映するには実質変更が必要ですが、調整上限${maximumRevisions}回に達したため差し戻しました。`,
-      { state: '廃案' }
-    );
-    return updateProposal(proposal.id, remanded);
-  }
-  const feedback = reviews.map((review) => ({ verdict: review.verdict, reasons: review.reasons }));
-  const request = {
-    title: proposal.title,
-    summary: proposal.summary,
-    priorDraft: proposal.body,
-    constitutionalReview: feedback,
-    instruction: '違憲・判断不能の理由だけを修正し、関係ない内容を増やさない'
-  };
-  const body = proposal.kind === 'amendment'
-    ? await draftAmendment({ guildId: guild.id, request, constitution })
-    : await draftBill({
-      guildId: guild.id,
-      petition: request,
-      constitution,
-      activeLaws: listLaws(guild.id),
-      policy: constitution.policy
-    });
-  const now = Date.now();
-  const nextRevision = proposal.revision + 1;
-  const transition = proposalTransition(proposal, 'revise');
-  const stageEndsAt = proposalStageEnd(transition, now);
-  const publicDiscussion = transition.target.handler === 'public_discussion';
-  const revised = {
-    ...proposal,
-    title: body.title,
-    summary: body.summary,
-    body,
-    status: transition.targetName,
-    revision: nextRevision,
-    stage_started_at: now,
-    stage_ends_at: stageEndsAt,
-    debate_extensions: 0,
-    retry_after: null,
-    failure_count: 0,
-    last_error: null
-  };
-  await postProposalUpdate(
-    guild,
-    revised,
-    publicDiscussion
-      ? `違憲審査の指摘を反映した調整案を公開しました。最終案ではないため、もう一度この投稿で討議します。締切: <t:${Math.floor(revised.stage_ends_at / 1000)}:F>`
-      : '違憲審査の指摘を反映した改訂案を公開しました。憲法の実行規則に従って次の段階へ進みます。',
-    { files: [
-      ...proposalBodyFiles(proposal.kind, body, '調整案'),
-      { attachment: Buffer.from(`${JSON.stringify({ source: 'constitutional_review', feedback }, null, 2)}\n`), name: '調整理由.json' }
-    ], state: publicDiscussion ? '討議' : '草案' }
-  );
-  return updateProposal(proposal.id, revised);
-}
-
-function proposalBodyFiles(kind, body, label) {
-  const fullText = kind === 'amendment'
-    ? `# ${body.title}\n\n${body.content}`
-    : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``;
-  return [
-    { attachment: Buffer.from(fullText), name: `${label}全文.md` },
-    {
-      attachment: Buffer.from(`${JSON.stringify(kind === 'amendment' ? (body.rules ?? body.policy) : body.provisions, null, 2)}\n`),
-      name: kind === 'amendment' ? '憲法実行規則.json' : '執行定義.json'
-    }
-  ];
-}
-
-function debateSummaryText(summary, heading) {
-  return [
-    `## ${heading}`,
-    summary.summary,
-    ...(summary.points.length ? ['**出た論点**', ...summary.points.map((point) => `- ${point}`)] : [])
-  ].join('\n').slice(0, 2_000);
-}
-
-/**
- * AIは討議を要約するだけで採否を決めない。意見が出た案件は異議の受付へ送り、
- * 意見が一件もない案件だけ、そのままの本文を最終案として固定する。
- */
-async function summarizeAndOpenObjections(guild, proposal, context) {
-  const {
-    runtime, constitution, procedure, rows, discussion,
-    deliberationTransition, deliberationState, quietClose, now
-  } = context;
-  const summary = discussion.length > 0
-    ? await summarizeProposalDebate({ guildId: guild.id, proposal, discussion, constitution })
-    : {
-        summary: quietClose
-          ? '実行規則の無風期間が過ぎるまで意見が投稿されなかったため、討議を締め切りました。'
-          : '討議期間中に意見は投稿されませんでした。',
-        points: [],
-        materialFeedback: false,
-        lateMaterialFeedback: false
-      };
-  const summaryFile = {
-    attachment: Buffer.from(`${JSON.stringify(summary, null, 2)}\n`),
-    name: '討議整理.json'
-  };
-
-  if (runtime.state.handler === 'public_discussion'
-    && procedure.extendOnLateMaterialFeedback
-    && summary.lateMaterialFeedback
-    && Number(proposal.debate_extensions ?? 0) < procedure.maximumDebateExtensions) {
-    const transition = proposalTransition(proposal, 'extended');
-    const stageEndsAt = now + procedure.debateExtensionMilliseconds;
-    const extended = {
-      ...proposal,
-      status: transition.targetName,
-      stage_ends_at: stageEndsAt,
-      debate_extensions: Number(proposal.debate_extensions ?? 0) + 1,
-      retry_after: null,
-      failure_count: 0,
-      last_error: null
-    };
-    await postProposalUpdate(
-      guild,
-      extended,
-      `${debateSummaryText(summary, '討議を延長します')}\n\n締切直前に実質的な論点が出たため、応答時間を確保します。新しい締切: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
-      { state: '討議', files: [summaryFile] }
-    );
-    const saved = updateProposal(proposal.id, extended);
-    recordProposalDeliberation({
-      proposalId: proposal.id, revision: proposal.revision, outcome: 'extended',
-      discussion: rows, decision: summary
-    });
-    return saved;
-  }
-
-  if (discussion.length === 0) {
-    return finalizeProposalBody(guild, proposal, {
-      runtime,
-      fromState: deliberationState,
-      outcome: 'uncontested',
-      note: `${debateSummaryText(summary, '討議の整理')}\n\n意見がなかったため、この本文を最終案として固定し、違憲審査へ進みます。`,
-      files: [summaryFile],
-      decision: summary,
-      rows,
-      now
-    });
-  }
-
-  const transition = proposalTransitionFrom(runtime, deliberationState, 'summarized');
-  const stageEndsAt = proposalStageEnd(transition, now);
-  const required = Number(transition.target.config.required);
-  const waiting = {
-    ...proposal,
-    status: transition.targetName,
-    stage_started_at: now,
-    stage_ends_at: stageEndsAt,
-    debate_extensions: 0,
-    retry_after: null,
-    failure_count: 0,
-    last_error: null
-  };
-  await postProposalUpdate(
-    guild,
-    waiting,
-    [
-      debateSummaryText(summary, '討議の整理'),
-      '',
-      `この本文のままでよくない人は、下のボタンから調整を求めてください。どう直すかを書いて出します。提案者を含め、誰の異議も同じ1件です。`,
-      `締切までに異議が${required}件そろえば、その指示で調整案を作って再討議します。そろわなければ、この本文が最終案になります。期限: <t:${Math.floor(stageEndsAt / 1000)}:F>`
-    ].join('\n'),
-    { state: '討議', components: objectionButtons(proposal.id), files: [summaryFile] }
-  );
-  if (deliberationTransition) updateProposal(proposal.id, { status: deliberationState });
-  const saved = updateProposal(proposal.id, waiting);
-  recordProposalDeliberation({
-    proposalId: proposal.id, revision: proposal.revision, outcome: 'summarized',
-    discussion: rows, decision: summary
-  });
-  return saved;
-}
-
-async function finalizeProposalBody(guild, proposal, {
-  runtime, fromState, outcome, note, files = [], decision, rows, body = null, now = Date.now()
-}) {
-  // outcomeは実行規則の遷移名と監査記録の結果名を兼ねる (uncontested / finalized / expired)。
-  const transition = proposalTransitionFrom(runtime, fromState, outcome);
-  const finalBody = body ?? proposal.body;
-  const finalProposal = {
-    ...proposal,
-    title: finalBody.title,
-    summary: finalBody.summary,
-    body: finalBody,
-    status: transition.targetName,
-    stage_started_at: now,
-    stage_ends_at: null,
-    debate_extensions: 0,
-    retry_after: null,
-    failure_count: 0,
-    last_error: null
-  };
-  await postProposalUpdate(guild, finalProposal, note, {
-    state: '違憲審査',
-    files: [...proposalBodyFiles(finalProposal.kind, finalProposal.body, '最終案'), ...files]
-  });
-  if (fromState !== proposal.status) updateProposal(proposal.id, { status: fromState });
-  const saved = updateProposal(proposal.id, finalProposal);
-  recordProposalDeliberation({
-    proposalId: proposal.id, revision: proposal.revision, outcome, discussion: rows, decision
-  });
-  return transition.target.handler === 'constitutional_panel'
-    ? constitutionalReviewProposal(guild, saved)
-    : saved;
-}
-
-function deliberationText(decision, heading) {
-  const section = (label, values) => values.length
-    ? [`**${label}**`, ...values.map((value) => `- ${value}`)]
-    : [];
-  return [
-    `## ${heading}`,
-    decision.summary,
-    ...section('採用した意見', decision.accepted),
-    ...section('採用しなかった意見', decision.rejected),
-    ...section('変更点', decision.changes)
-  ].join('\n').slice(0, 2_000);
-}
-
-export async function completeProposalDebate(guild, proposal, now = Date.now(), { quietClose = false } = {}) {
-  const constitution = getActiveConstitution(guild.id);
-  const procedurePolicy = getConstitution(proposal.constitution_id)?.policy ?? constitution.policy;
-  const runtime = proposalRuntime(proposal);
-  if (!['public_discussion', 'ai_deliberation'].includes(runtime?.state?.handler)
-    || (runtime.state.handler === 'public_discussion'
-      && !['initial', 'revision'].includes(runtime.state.config.phase))) {
-    throw new Error('この案件は受付時の旧立法手続で進行しています。');
-  }
-  const procedure = legislationProcedure(procedurePolicy);
-  const rows = proposalDiscussion(
-    proposal.id,
-    Number(proposal.stage_started_at ?? proposal.created_at),
-    Number(proposal.stage_ends_at ?? now),
-    300
-  );
-  const lateBoundary = Number(proposal.stage_ends_at ?? now) - procedure.lateFeedbackWindowMilliseconds;
-  const discussion = rows.map((row, index) => ({
-    number: index + 1,
-    content: row.content,
-    createdAt: row.created_at,
-    late: row.created_at >= lateBoundary
-  }));
-  const deliberationTransition = runtime.state.handler === 'public_discussion'
-    ? proposalTransition(proposal, 'expired')
-    : null;
-  if (deliberationTransition && deliberationTransition.target.handler !== 'ai_deliberation') {
-    throw new Error('公開討議の次にAI整理を行う実行規則ではありません。');
-  }
-  const deliberationState = deliberationTransition?.targetName ?? proposal.status;
-  // summarizedを持つ実行規則では、AIは整理までで採否を決めず、異議の数が決める。
-  if (runtime.workflow.states[deliberationState]?.on?.summarized) {
-    return summarizeAndOpenObjections(guild, proposal, {
-      runtime, constitution, procedure, rows, discussion,
-      deliberationTransition, deliberationState, quietClose, now
-    });
-  }
-  const decision = discussion.length > 0
-    ? await deliberateProposal({
-        guildId: guild.id,
-        proposal,
-        discussion,
-        constitution,
-        activeLaws: listLaws(guild.id)
-      })
-    : {
-        decision: 'finalize',
-        summary: quietClose
-          ? '実行規則の無風期間が過ぎるまで意見が投稿されなかったため、討議を締め切りました。'
-          : '討議期間中に法案を変更する意見はありませんでした。',
-        accepted: [],
-        rejected: [],
-        changes: [],
-        lateMaterialFeedback: false,
-        body: null
-      };
-  const publicDecision = { ...decision };
-  delete publicDecision.body;
-
-  if (runtime.state.handler === 'public_discussion'
-    && procedure.extendOnLateMaterialFeedback
-    && decision.lateMaterialFeedback
-    && Number(proposal.debate_extensions ?? 0) < procedure.maximumDebateExtensions) {
-    const transition = proposalTransition(proposal, 'extended');
-    const stageEndsAt = now + procedure.debateExtensionMilliseconds;
-    const extended = {
-      ...proposal,
-      status: transition.targetName,
-      stage_ends_at: stageEndsAt,
-      debate_extensions: Number(proposal.debate_extensions ?? 0) + 1,
-      retry_after: null,
-      failure_count: 0,
-      last_error: null
-    };
-    await postProposalUpdate(
-      guild,
-      extended,
-      `${deliberationText(decision, '討議を延長します')}\n\n締切直前に実質的な論点が出たため、応答時間を確保します。新しい締切: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
-      { state: '討議', files: [{ attachment: Buffer.from(`${JSON.stringify(publicDecision, null, 2)}\n`), name: '討議整理.json' }] }
-    );
-    const saved = updateProposal(proposal.id, extended);
-    recordProposalDeliberation({
-      proposalId: proposal.id,
-      revision: proposal.revision,
-      outcome: 'extended',
-      discussion: rows,
-      decision: publicDecision
-    });
-    return saved;
-  }
-
-  if (decision.decision === 'revise') {
-    if (proposal.revision - 1 >= procedure.maximumRevisions) {
-      const transition = proposalTransitionFrom(runtime, deliberationState, 'remanded');
-      const remanded = {
-        ...proposal,
-        status: transition.targetName,
-        stage_ends_at: now,
-        retry_after: null,
-        last_error: null
-      };
-      await postProposalUpdate(
-        guild,
-        remanded,
-        `${deliberationText(decision, '討議の整理')}\n\n実質変更がさらに必要ですが、調整上限${procedure.maximumRevisions}回に達したため差し戻します。`,
-        { state: '廃案', files: [{ attachment: Buffer.from(`${JSON.stringify(publicDecision, null, 2)}\n`), name: '討議整理.json' }] }
-      );
-      if (deliberationTransition) updateProposal(proposal.id, { status: deliberationState });
-      const saved = updateProposal(proposal.id, remanded);
-      recordProposalDeliberation({
-        proposalId: proposal.id,
-        revision: proposal.revision,
-        outcome: 'remanded',
-        discussion: rows,
-        decision: publicDecision
-      });
-      return saved;
-    }
-    const transition = proposalTransitionFrom(runtime, deliberationState, 'revised');
-    const stageEndsAt = proposalStageEnd(transition, now);
-    const revised = {
-      ...proposal,
-      title: decision.body.title,
-      summary: decision.body.summary,
-      body: decision.body,
-      status: transition.targetName,
-      revision: proposal.revision + 1,
-      stage_started_at: now,
-      stage_ends_at: stageEndsAt,
-      debate_extensions: 0,
-      retry_after: null,
-      failure_count: 0,
-      last_error: null
-    };
-    await postProposalUpdate(
-      guild,
-      revised,
-      `${deliberationText(decision, '調整案を公開します')}\n\n実質的な変更があるため、調整案を再討議します。締切: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
-      {
-        state: '討議',
-        files: [
-          ...proposalBodyFiles(revised.kind, revised.body, '調整案'),
-          { attachment: Buffer.from(`${JSON.stringify(publicDecision, null, 2)}\n`), name: '討議整理.json' }
-        ]
-      }
-    );
-    if (deliberationTransition) updateProposal(proposal.id, { status: deliberationState });
-    const saved = updateProposal(proposal.id, revised);
-    recordProposalDeliberation({
-      proposalId: proposal.id,
-      revision: proposal.revision,
-      outcome: 'revised',
-      discussion: rows,
-      decision: publicDecision
-    });
-    return saved;
-  }
-
-  return finalizeProposalBody(guild, proposal, {
-    runtime,
-    fromState: deliberationState,
-    outcome: 'finalized',
-    note: `${deliberationText(decision, '最終案を固定しました')}\n\nここから本文は変更せず、違憲審査へ進みます。`,
-    files: [{ attachment: Buffer.from(`${JSON.stringify(publicDecision, null, 2)}\n`), name: '討議整理.json' }],
-    decision: publicDecision,
-    body: decision.body ?? null,
-    rows,
-    now
-  });
-}
-
-/**
- * 提案した時点で法案は提案者から離れる。調整するかどうかは、有権者が出した
- * 異議の数だけで決まり、AIも提案者も採否を持たない。
- */
-export async function fileProposalObjection(guild, actor, proposalId, instruction) {
-  const proposal = getProposal(proposalId);
-  if (!proposal || proposal.guild_id !== guild.id) throw new Error('案件が見つかりません。');
-  const runtime = proposalRuntime(proposal);
-  if (runtime?.state?.handler !== 'objection_window') throw new Error('この案件は異議の受付中ではありません。');
-  if (Number(proposal.stage_ends_at ?? 0) <= Date.now()) throw new Error('異議の受付は締め切られています。');
-  if (!governanceActionAllowed(guild.id, actor.id, 'vote')) throw new Error('異議の提出が制裁により停止されています。');
-  const text = String(instruction ?? '').trim();
-  if (!text) throw new Error('どう直すかを書いてください。');
-  const procedure = legislationProcedure(getConstitution(proposal.constitution_id)?.policy ?? runtime.constitution.policy);
-  if (proposal.revision - 1 >= procedure.maximumRevisions) {
-    throw new Error(`調整は${procedure.maximumRevisions}回までです。この案は最終案として投票へ進みます。`);
-  }
-  const objections = recordProposalObjection({
-    proposalId: proposal.id,
-    revision: proposal.revision,
-    userId: actor.id,
-    instruction: text.slice(0, 2_000),
-    kind: 'revision'
-  });
-  const required = Number(runtime.state.config.required);
-  await postProposalUpdate(
-    guild,
-    proposal,
-    [
-      `${publicMemberLabel(actor.id)} が調整を求めました（${objections.length}/${required}件）。`,
-      `**指示**\n${text.slice(0, 1_000)}`
-    ].join('\n'),
-    { state: '討議', components: objectionButtons(proposal.id) }
-  );
-  writeAudit({
-    guildId: guild.id, actorType: 'member', actorId: actor.id, action: 'proposal.objection',
-    targetType: 'proposal', targetId: proposal.id,
-    detail: { revision: proposal.revision, count: objections.length, required, public: true }
-  });
-  return { proposal, objections, required };
-}
-
-/**
- * 異議受付の締切。必要数に達していれば集まった指示で調整案を作り、
- * 達していなければその本文をそのまま最終案にする。
- */
-async function closeProposalObjections(guild, proposal, now) {
-  const runtime = proposalRuntime(proposal);
-  const required = Number(runtime.state.config.required);
-  const objections = listProposalObjections(proposal.id, proposal.revision, 'revision');
-  const rows = [...listProposalDeliberations(proposal.id)].reverse()
-    .find((entry) => entry.outcome === 'summarized')?.discussion ?? [];
-  const instructions = objections.map((objection, index) => ({
-    number: index + 1,
-    instruction: objection.instruction,
-    createdAt: objection.created_at
-  }));
-
-  const procedure = legislationProcedure(getConstitution(proposal.constitution_id)?.policy ?? runtime.constitution.policy);
-  const revisable = proposal.revision - 1 < procedure.maximumRevisions;
-
-  if (objections.length < required) {
-    // 人間が誰も動かなくても討議が死なないよう、席が反映漏れだけを検査する。
-    // 席は論点の採否を決めず、討議整理に載った論点番号しか指せない。
-    const reflection = revisable
-      ? await reviewUnreflectedPoints(guild, proposal, runtime)
-      : null;
-    if (reflection?.points.length) {
-      return reviseFromInstructions(guild, proposal, {
-        runtime,
-        rows,
-        note: `討議の論点${reflection.points.map((entry) => entry.number).join('・')}が本文に入っていないと${reflection.required}席以上が認めたため、その論点に限って調整案を作りました。最終案ではないため、この投稿でもう一度討議します。`,
-        instruction: reflection.points.map((entry) => `${entry.number}. ${entry.point}`).join('\n'),
-        decision: { source: 'reflection', required: reflection.required, points: reflection.points, outputs: reflection.outputs },
-        files: [{ attachment: Buffer.from(`${JSON.stringify(reflection, null, 2)}\n`), name: '反映漏れ審査.json' }],
-        now
-      });
-    }
-    return finalizeProposalBody(guild, proposal, {
-      runtime,
-      fromState: proposal.status,
-      outcome: 'finalized',
-      note: objections.length === 0
-        ? `調整を求める異議がなく、討議の論点も本文に反映されていると席が認めたため、この本文を最終案として固定し、違憲審査へ進みます。`
-        : `調整を求める異議が${objections.length}件で、必要な${required}件に届かなかったため、この本文を最終案として固定します。`,
-      files: instructions.length
-        ? [{ attachment: Buffer.from(`${JSON.stringify(instructions, null, 2)}\n`), name: '異議.json' }]
-        : [],
-      decision: { objections: instructions.length, required, sustained: false, reflection: reflection ?? null },
-      rows,
-      now
-    });
-  }
-  if (!revisable) {
-    return finalizeProposalBody(guild, proposal, {
-      runtime,
-      fromState: proposal.status,
-      outcome: 'finalized',
-      note: `調整の上限${procedure.maximumRevisions}回に達しているため、異議${objections.length}件を記録した上でこの本文を最終案として固定します。`,
-      files: [{ attachment: Buffer.from(`${JSON.stringify(instructions, null, 2)}\n`), name: '異議.json' }],
-      decision: { objections: instructions, required, sustained: false, revisionLimit: procedure.maximumRevisions },
-      rows,
-      now
-    });
-  }
-
-  return reviseFromInstructions(guild, proposal, {
-    runtime,
-    rows,
-    note: `調整を求める異議が${objections.length}件そろったため、その指示で調整案を作りました。最終案ではないため、この投稿でもう一度討議します。`,
-    instruction: instructions.map((entry) => `${entry.number}. ${entry.instruction}`).join('\n'),
-    decision: { source: 'objection', objections: instructions, required, sustained: true },
-    files: [{ attachment: Buffer.from(`${JSON.stringify(instructions, null, 2)}\n`), name: '異議.json' }],
-    now
-  });
-}
-
-async function reviewUnreflectedPoints(guild, proposal, runtime) {
-  const panelName = runtime.state.config.reflectionPanel;
-  const panel = panelName ? runtime.compiled.rules.panels[panelName] : null;
-  if (!panel) return null;
-  const summary = [...listProposalDeliberations(proposal.id)].reverse()
-    .find((entry) => entry.outcome === 'summarized')?.decision ?? null;
-  const points = Array.isArray(summary?.points) ? summary.points : [];
-  if (points.length === 0) return null;
-  const { outputs } = await reviewDebateReflection({
-    guildId: guild.id,
-    proposal,
-    points,
-    constitution: runtime.constitution,
-    seats: panel.seats
-  });
-  const sustained = sustainedReflectionPoints(outputs, panel.required.unreflected);
-  return {
-    required: panel.required.unreflected,
-    seats: panel.seats,
-    outputs,
-    points: sustained.map((entry) => ({ ...entry, point: points[entry.number - 1] }))
-  };
-}
-
-/**
- * 指示に従って条文を書き直し、再討議へ戻す。指示を書くのは構成員か反映漏れの
- * 認定で、AIはその指示を条文の形にするだけ。
- */
-async function reviseFromInstructions(guild, proposal, { runtime, rows, note, instruction, decision, files, now }) {
-  const body = await draftProposalRevision({
-    guildId: guild.id,
-    proposal,
-    discussion: rows.map((row, index) => ({ number: index + 1, content: row.content, createdAt: row.created_at })),
-    instruction,
-    constitution: runtime.constitution,
-    activeLaws: listLaws(guild.id)
-  });
-  const transition = proposalTransitionFrom(runtime, proposal.status, 'revised');
-  const stageEndsAt = proposalStageEnd(transition, now);
-  const revised = {
-    ...proposal,
-    title: body.title,
-    summary: body.summary,
-    body,
-    status: transition.targetName,
-    revision: proposal.revision + 1,
-    stage_started_at: now,
-    stage_ends_at: stageEndsAt,
-    debate_extensions: 0,
-    retry_after: null,
-    failure_count: 0,
-    last_error: null
-  };
-  await postProposalUpdate(
-    guild,
-    revised,
-    `${note} 締切: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
-    {
-      state: '討議',
-      components: [],
-      files: [...proposalBodyFiles(revised.kind, revised.body, '調整案'), ...files]
-    }
-  );
-  const saved = updateProposal(proposal.id, revised);
-  recordProposalDeliberation({
-    proposalId: proposal.id, revision: proposal.revision, outcome: 'revised',
-    discussion: rows, decision
-  });
-  return saved;
-}
-
-async function constitutionalReviewProposal(guild, proposal) {
-  const runtime = proposalRuntime(proposal);
-  if (runtime?.state?.handler !== 'constitutional_panel') {
-    throw new Error('この案件は現在、違憲審査の段階ではありません。');
-  }
-  const constitution = runtime.constitution;
-  proposal = updateProposal(proposal.id, {
-    stage_started_at: Date.now(),
-    stage_ends_at: null,
-    retry_after: null,
-    last_error: null
-  });
-  await postProposalUpdate(guild, proposal, `${constitution.policy.judiciary.panelSeats}席の事前違憲審査を開始しました。`, { state: '違憲審査' });
-  const panel = await runConstitutionalPanel({
-    guildId: guild.id,
-    targetType: proposal.kind,
-    targetId: proposal.id,
-    phase: 'pre',
-    constitution,
-    target: proposal.body
-  });
-  await postProposalUpdate(guild, proposal, '事前違憲審査の理由と憲法条文参照を公開します。', {
-    files: [{
-      attachment: Buffer.from(`${JSON.stringify({
-        revision: proposal.revision,
-        phase: 'pre',
-        outputs: publicPanelOutputs(panel.outputs)
-      }, null, 2)}\n`),
-      name: '違憲審査.json'
-    }]
-  });
-  const constitutional = panel.outputs.filter((output) => output.verdict === 'constitutional').length;
-  const anyUnconstitutionalAmendment = proposal.kind === 'amendment'
-    && panel.outputs.some((output) => output.verdict === 'unconstitutional');
-  const passed = !anyUnconstitutionalAmendment
-    && constitutional >= constitution.policy.judiciary.constitutionalVotesRequired;
-  if (!passed) return reviseProposal(guild, proposal, panel.outputs);
-  const transition = proposalTransition(proposal, 'passed');
-  if (transition.target.handler === 'public_discussion') {
-    const now = Date.now();
-    const debateEndsAt = proposalStageEnd(transition, now);
-    const debating = {
-      ...proposal,
-      status: transition.targetName,
-      stage_started_at: now,
-      stage_ends_at: debateEndsAt,
-      retry_after: null,
-      failure_count: 0,
-      last_error: null
-    };
-    await postProposalUpdate(
-      guild,
-      debating,
-      `合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats}で審査を通過しました。受付時の手続に従う討議期限: <t:${Math.floor(debateEndsAt / 1000)}:F>`,
-      { state: '討議' }
-    );
-    return updateProposal(proposal.id, debating);
-  }
-  if (!['public_vote', 'council_decision'].includes(transition.target.handler)) {
-    throw new Error('違憲審査通過後の段階を実行できません。');
-  }
-  await postProposalUpdate(
-    guild,
-    proposal,
-    `合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats}で最終案の審査を通過しました。本文は変更せず${transition.target.handler === 'public_vote' ? '投票' : '成立判定'}へ進みます。`,
-    { state: '違憲審査' }
-  );
-  if (transition.target.handler === 'council_decision') {
-    const decided = updateProposal(proposal.id, {
-      status: transition.targetName,
-      stage_started_at: Date.now(),
-      stage_ends_at: null,
-      retry_after: null,
-      failure_count: 0,
-      last_error: null
-    });
-    return councilDecideProposal(guild, decided);
-  }
-  return openProposalVote(guild, proposal, transition);
-}
-
-async function openProposalVote(guild, proposal, suppliedTransition = null) {
-  const { governance } = requireGovernance(guild.id);
-  const runtime = proposalRuntime(proposal);
-  const transition = suppliedTransition ?? (runtime?.state?.handler === 'public_discussion'
-    ? proposalTransition(proposal, 'expired')
-    : proposalTransition(proposal, 'passed'));
+  const transition = proposalTransition(proposal, outcome);
   if (transition.target.handler !== 'public_vote') throw new Error('投票開始へ遷移できない案件です。');
   const procedurePolicy = transition.constitution.policy;
   const voteRule = proposal.kind === 'amendment'
@@ -1350,216 +414,11 @@ async function openProposalVote(guild, proposal, suppliedTransition = null) {
   });
 }
 
-/**
- * AI席が成立を決める憲法では、@立法 への依頼は即時の案件にならず、次の国会の
- * 議題候補として溜まる。採否は国会が理由付きで公開する。
- */
-export function parliamentOpinionMode(guildId) {
-  return Boolean(getActiveConstitution(guildId)?.rules?.panels?.council);
-}
-
-export function nextParliamentSessionAt(guildId) {
-  const governance = getGovernanceGuild(guildId);
-  const last = Number(governance?.last_weekly_scan_at ?? 0);
-  return last > 0 ? last + 7 * DAY_MS : null;
-}
-
-export function submitParliamentOpinion(guild, member, { kind, title, summary, source, sourceMessageId = null }) {
-  if (!governanceActionAllowed(guild.id, member.id, 'petition')) {
-    throw new Error('意見の提出が制裁により停止されています。');
-  }
-  return recordParliamentOpinion({
-    guildId: guild.id,
-    userId: member.id,
-    kind: kind === 'amendment' ? 'amendment' : 'petition',
-    title: String(title).slice(0, 200),
-    summary: String(summary).slice(0, 1_800),
-    source: String(source ?? 'mention'),
-    sourceMessageId
-  });
-}
-
-/**
- * 成立判定。実行規則のpanelが定める席と必要票だけで決まり、人間の投票は使わない。
- * 席ごとの理由は案件へ公開し、監査記録にも残す。
- */
-async function councilDecideProposal(guild, proposal) {
-  const runtime = proposalRuntime(proposal);
-  if (runtime?.state?.handler !== 'council_decision') throw new Error('この案件は成立判定の段階ではありません。');
-  const panel = runtime.compiled.rules.panels[runtime.state.config.panel];
-  const summary = [...listProposalDeliberations(proposal.id)].reverse()
-    .find((entry) => ['summarized', 'uncontested'].includes(entry.outcome))?.decision ?? null;
-  const { outputs } = await decideEnactment({
-    guildId: guild.id,
-    proposal,
-    summary,
-    constitution: runtime.constitution,
-    activeLaws: listLaws(guild.id),
-    seats: panel.seats
-  });
-  const enact = outputs.filter((output) => output.verdict === 'enact').length;
-  const passed = enact >= panel.required.enact;
-  await postProposalUpdate(
-    guild,
-    proposal,
-    `国会の成立判定: 賛成 ${enact}/${panel.seats}席 (必要 ${panel.required.enact}席)。${passed ? '成立させます。' : '成立させません。'}`,
-    {
-      state: '違憲審査',
-      files: [{
-        attachment: Buffer.from(`${JSON.stringify({ seats: panel.seats, required: panel.required.enact, outputs }, null, 2)}\n`),
-        name: '成立判定.json'
-      }]
-    }
-  );
-  recordProposalDeliberation({
-    proposalId: proposal.id,
-    revision: proposal.revision,
-    outcome: passed ? 'council_enact' : 'council_reject',
-    discussion: [],
-    decision: { seats: panel.seats, required: panel.required.enact, enact, outputs }
-  });
-  if (!passed) {
-    const transition = proposalTransition(proposal, 'rejected');
-    const rejected = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
-    await postProposalUpdate(guild, rejected, '国会は必要票に達しなかったため、この案は成立しませんでした。', { state: '否決' });
-    return rejected;
-  }
-  const transition = proposalTransition(proposal, 'passed');
-  if (transition.target.handler === 'enactment_hold') return openEnactmentHold(guild, proposal, transition);
-  return enactPassedProposal(guild, proposal, 'council');
-}
-
-/**
- * 憲法改正の保留期間。施行済みの憲法は巻き戻せないので、AI席が可決した改正は
- * 施行の前に人間が止められるようにする。
- */
-async function openEnactmentHold(guild, proposal, transition) {
-  const now = Date.now();
-  const stageEndsAt = proposalStageEnd(transition, now);
-  const holding = updateProposal(proposal.id, {
-    status: transition.targetName,
-    stage_started_at: now,
-    stage_ends_at: stageEndsAt,
-    retry_after: null,
-    failure_count: 0,
-    last_error: null
-  });
-  await postProposalUpdate(
-    guild,
-    holding,
-    [
-      `国会はこの改憲案を可決しました。施行の前に保留期間を置きます。期限: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
-      `期限までに${transition.target.config.required}人が下のボタンから異議を出すと、この改正は成立しません。`
-    ].join('\n'),
-    { state: '違憲審査', components: enactmentHoldButtons(proposal.id) }
-  );
-  return holding;
-}
-
-export async function fileEnactmentObjection(guild, actor, proposalId, reason) {
-  const proposal = getProposal(proposalId);
-  if (!proposal || proposal.guild_id !== guild.id) throw new Error('案件が見つかりません。');
-  const runtime = proposalRuntime(proposal);
-  if (runtime?.state?.handler !== 'enactment_hold') throw new Error('この案件は保留期間ではありません。');
-  if (Number(proposal.stage_ends_at ?? 0) <= Date.now()) throw new Error('保留期間は終わっています。');
-  if (!governanceActionAllowed(guild.id, actor.id, 'vote')) throw new Error('異議の提出が制裁により停止されています。');
-  const text = String(reason ?? '').trim();
-  if (!text) throw new Error('理由を書いてください。');
-  const required = Number(runtime.state.config.required);
-  const objections = recordProposalObjection({
-    proposalId: proposal.id,
-    revision: proposal.revision,
-    userId: actor.id,
-    instruction: text.slice(0, 2_000),
-    kind: 'veto'
-  });
-  writeAudit({
-    guildId: guild.id, actorType: 'member', actorId: actor.id, action: 'proposal.enactment_objection',
-    targetType: 'proposal', targetId: proposal.id,
-    detail: { count: objections.length, required, public: true }
-  });
-  if (objections.length < required) {
-    await postProposalUpdate(
-      guild,
-      proposal,
-      `${publicMemberLabel(actor.id)} が改憲の成立に異議を出しました（${objections.length}/${required}人）。\n**理由**\n${text.slice(0, 1_000)}`,
-      { state: '違憲審査', components: enactmentHoldButtons(proposal.id) }
-    );
-    return { proposal, objections, required, vetoed: false };
-  }
-  const transition = proposalTransitionFrom(runtime, proposal.status, 'vetoed');
-  const vetoed = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
-  await postProposalUpdate(
-    guild,
-    vetoed,
-    `保留期間中に${objections.length}人の異議がそろったため、この改正は成立しませんでした。`,
-    { state: '廃案', components: [] }
-  );
-  return { proposal: vetoed, objections, required, vetoed: true };
-}
-
-async function closeEnactmentHold(guild, proposal, now) {
-  const runtime = proposalRuntime(proposal);
-  const required = Number(runtime.state.config.required);
-  const objections = listProposalObjections(proposal.id, proposal.revision, 'veto');
-  if (objections.length >= required) {
-    const transition = proposalTransitionFrom(runtime, proposal.status, 'vetoed');
-    const vetoed = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: now });
-    await postProposalUpdate(guild, vetoed, `保留期間中の異議が${objections.length}人に達したため、この改正は成立しませんでした。`, { state: '廃案', components: [] });
-    return vetoed;
-  }
-  await postProposalUpdate(
-    guild,
-    proposal,
-    objections.length === 0
-      ? '保留期間に異議がなかったため、この改正を施行します。'
-      : `保留期間の異議は${objections.length}人で必要な${required}人に届かなかったため、この改正を施行します。`,
-    { state: '違憲審査', components: [] }
-  );
-  return enactPassedProposal(guild, proposal, 'council', 'expired');
-}
-
-/**
- * 施行後の停止。AI席だけで成立させる手続で、人間が唯一持つ制動。必要数に達したら
- * その法律を直ちに止め、次の国会で維持か廃止を決める。
- */
-export async function fileLawSuspension(guild, actor, lawId, reason) {
-  const { constitution } = requireGovernance(guild.id);
-  const law = getCurrentLawVersion(lawId) ?? getLaw(lawId);
-  if (!law || law.guild_id !== guild.id) throw new Error('法律が見つかりません。');
-  if (law.status !== 'active') throw new Error('この法律は現行ではありません。');
-  if (!governanceActionAllowed(guild.id, actor.id, 'vote')) throw new Error('停止の請求が制裁により停止されています。');
-  const text = String(reason ?? '').trim();
-  if (!text) throw new Error('理由を書いてください。');
-  const required = lawSuspensionRequirement(constitution);
-  if (!required) throw new Error('この憲法は施行後の停止を定めていません。');
-  const suspensions = recordLawSuspension({
-    guildId: guild.id, lawId: law.id, userId: actor.id, reason: text.slice(0, 1_000)
-  });
-  writeAudit({
-    guildId: guild.id, actorType: 'member', actorId: actor.id, action: 'law.suspension_request',
-    targetType: 'law', targetId: law.id, detail: { count: suspensions.length, required, public: true }
-  });
-  if (suspensions.length < required) return { law, suspensions, required, suspended: false };
-  const suspended = updateLaw(law.id, { status: 'suspended' });
-  await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
-    console.error(`Failed to publish suspension of law ${law.id}:`, error);
-  });
-  return { law: suspended, suspensions, required, suspended: true };
-}
-
-function lawSuspensionRequirement(constitution) {
-  const compiled = constitution.rules
-    ? { rules: constitution.rules }
-    : compileConstitution({ content: constitution.content, policy: constitution.policy });
-  const value = compiled.rules?.workflows?.law?.config?.suspensionRequired;
-  return Number.isInteger(value) && value > 0 ? value : null;
-}
-
 async function closeProposalVote(guild, proposal) {
   const { governance } = requireGovernance(guild.id);
   const runtime = proposalRuntime(proposal);
   if (runtime?.state?.handler !== 'public_vote') throw new Error('この案件は投票中ではありません。');
+  const constitution = runtime.constitution;
   const summary = proposalVoteSummary(proposal.id);
   const result = closeGovernanceVote(
     { kind: proposal.kind, scope: proposal.vote_scope, ...summary },
@@ -1572,20 +431,11 @@ async function closeProposalVote(guild, proposal) {
     await postProposalUpdate(guild, proposal, `否決されました。賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / 定足数 ${summary.yes + summary.no + summary.abstain}/${result.quorumNeeded} / ${electorate}の反対 ${summary.trustedNo}/${summary.trustedTotal}有効票 (棄権 ${summary.trustedAbstain} / 有権者 ${summary.trustedElectorate})`, { state: '否決' });
     return proposal;
   }
-  return enactPassedProposal(guild, proposal, 'vote');
-}
-
-/**
- * 成立が決まった案件を施行する。人間の投票でもAI席の判定でも、ここから先は同じ。
- */
-async function enactPassedProposal(guild, proposal, enactedBy, outcome = 'passed') {
-  const runtime = proposalRuntime(proposal);
-  const constitution = runtime.constitution;
   if (proposal.kind === 'amendment') {
     const active = getActiveConstitution(guild.id);
     if (!proposal.target_hash || Number(proposal.target_id) !== Number(active?.id)
       || proposal.target_hash !== active?.content_hash) {
-      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected ?? runtime.state.on.vetoed;
+      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected;
       proposal = updateProposal(proposal.id, { status: staleTarget, stage_ends_at: Date.now() });
       await postProposalUpdate(guild, proposal, '審議中に現行憲法が更新されたため、この案は成立させず差し戻しました。最新版を基礎に再提出してください。', { state: '廃案' });
       return proposal;
@@ -1595,16 +445,18 @@ async function enactPassedProposal(guild, proposal, enactedBy, outcome = 'passed
       content: proposal.body.content,
       policy: proposal.body.policy,
       proposalId: proposal.id,
-      enactedBy,
+      enactedBy: 'vote',
       targetConstitutionId: proposal.target_id,
       targetHash: proposal.target_hash
     });
-    const transition = proposalTransition(proposal, outcome);
+    const transition = proposalTransition(proposal, 'passed');
     proposal = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
     await postProposalUpdate(guild, proposal, `改憲が成立しました。憲法 v${next.version} が有効です。`, { state: '成立' });
-    await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
-      console.error(`Failed to publish constitution v${next.version} in statute book:`, error);
-    });
+    try {
+      syncLawSite(guild);
+    } catch (error) {
+      console.error(`Failed to queue constitution v${next.version} for the public law site:`, error);
+    }
     // 改憲で既存法との関係が変わり得るため、各現行法を自動的に事後審査へ送る。
     // 審査自体は通常どおり答弁記録期間とpolicy指定のpanelを経る。
     const systemReporter = { id: guild.client.user.id };
@@ -1625,7 +477,7 @@ async function enactPassedProposal(guild, proposal, enactedBy, outcome = 'passed
   if (proposal.target_type === 'law') {
     const currentTarget = getCurrentLawVersion(proposal.target_id);
     if (!currentTarget || currentTarget.content_hash !== proposal.target_hash) {
-      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected ?? runtime.state.on.vetoed;
+      const staleTarget = runtime.state.on.stale ?? runtime.state.on.rejected;
       proposal = updateProposal(proposal.id, { status: staleTarget, stage_ends_at: Date.now() });
       await postProposalUpdate(guild, proposal, '審議中に改正対象の法律が更新されたため、この案は成立させず差し戻しました。最新版を基礎に再提出してください。', { state: '廃案' });
       return proposal;
@@ -1643,14 +495,16 @@ async function enactPassedProposal(guild, proposal, enactedBy, outcome = 'passed
     targetHash: proposal.target_hash,
     effectiveAt: Date.now()
   });
-  const transition = proposalTransition(proposal, outcome);
+  const transition = proposalTransition(proposal, 'passed');
   proposal = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
   await postProposalUpdate(guild, proposal, proposal.target_type === 'law'
     ? `可決・成立しました。「${law.title}」v${law.version} が有効です。旧版は履歴として保存します。`
     : `可決・成立しました。「${law.title}」はこの時点から有効です。`, { state: '成立' });
-  await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
-    console.error(`Failed to publish law ${law.id} in statute book:`, error);
-  });
+  try {
+    syncLawSite(guild);
+  } catch (error) {
+    console.error(`Failed to queue law ${law.id} for the public law site:`, error);
+  }
   return proposal;
 }
 
@@ -1685,20 +539,20 @@ export async function fileCriminalCase(guild, reporter, input) {
     lawId: law.id,
     offenseCode: offense.code,
     summary: input.summary,
-    status: summaryProcedure(policy) ? 'summary_review' : 'filing',
+    status: policeProcedure(policy) ? 'police_review' : 'filing',
     defenseUntil: null,
     allegedAt: evidenceRows.at(-1).occurredAt,
     constitutionId: constitution.id,
-    procedureVersion: summaryProcedure(policy) ? 2 : 1,
-    summaryEventKey: input.summaryEventKey ?? null,
+    procedureVersion: policeProcedure(policy) ? 2 : 1,
+    policeEventKey: input.policeEventKey ?? null,
     reporterType: input.official ? 'ai' : 'member'
   });
   for (const evidence of evidenceRows) {
     addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, ...evidence });
   }
   try {
-    return summaryProcedure(policy)
-      ? await finishSummaryReview(guild, caseRecord)
+    return policeProcedure(policy)
+      ? await finishPoliceReview(guild, caseRecord)
       : await finishCaseFiling(guild, caseRecord);
   } catch (error) {
     updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
@@ -1720,7 +574,7 @@ function profileForSanction(law, sanction, policy) {
   return definition.profile;
 }
 
-async function notifySummarySanction(guild, caseRecord, sanction) {
+async function notifyPoliceSanction(guild, caseRecord, sanction) {
   const member = await guild.members.fetch(sanction.user_id).catch(() => null);
   if (!member) return false;
   const label = sanction.type === 'warning'
@@ -1737,26 +591,93 @@ async function notifySummarySanction(guild, caseRecord, sanction) {
       'この処分に異議がある場合は「裁判を求める」を押してください。',
       sanction.type === 'warning' ? '警告は期限なく一度だけ裁判を求められます。' : '処分が続いている間、一度だけ裁判を求められます。'
     ].join('\n').slice(0, 1_900),
-    components: reviewRequestButtons(guild.id, sanction.id),
+    components: contestButtons(guild.id, sanction.id),
     allowedMentions: { parse: [] }
   }).then(() => true).catch(() => false);
   updateSanction(sanction.id, { notice_delivered: delivered ? 1 : 0 });
   return delivered;
 }
 
-async function continueSummarySanction(guild, caseRecord, sanction, procedure) {
-  const trialFirst = procedure.trialFirstSanctions.includes(sanction.type);
-  if (trialFirst) {
+function sanctionLabel(sanction) {
+  const name = ({
+    warning: '警告', restriction: '機能制限', timeout: 'タイムアウト', kick: 'キック', ban: '参加禁止'
+  })[sanction?.type] ?? '処分';
+  const seconds = Number(sanction?.duration_seconds ?? sanction?.durationSeconds ?? 0);
+  if (!seconds) return name;
+  if (seconds % 86_400 === 0) return `${name} ${seconds / 86_400}日`;
+  if (seconds % 3_600 === 0) return `${name} ${seconds / 3_600}時間`;
+  return `${name} ${Math.ceil(seconds / 60)}分`;
+}
+
+// 拘留は罰ではなく審理を確保する保全。裁判所へ送った事件の答弁期間だけ、
+// 憲法が定める上限の範囲で置く。経過時間は後の期間処分から差し引く。
+async function detainForCourt(guild, caseRecord, procedure) {
+  const { governance } = requireGovernance(guild.id);
+  if (getCaseDetention(caseRecord.id)) return null;
+  const now = Date.now();
+  const seconds = Math.min(
+    procedure.detentionMaximumSeconds,
+    Math.max(0, Math.floor(((caseRecord.defense_until ?? now) - now) / 1000))
+  );
+  if (seconds <= 0) return null;
+  const detention = createDetention({
+    caseId: caseRecord.id,
+    guildId: guild.id,
+    userId: caseRecord.accused_id,
+    reason: caseRecord.summary,
+    durationSeconds: seconds,
+    startedAt: now,
+    endsAt: now + seconds * 1000,
+    status: governance.enforcement_mode === 'live' ? 'active' : 'simulated'
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'system',
+    action: 'detention.started',
+    targetType: 'case',
+    targetId: caseRecord.id,
+    detail: { userId: caseRecord.accused_id, durationSeconds: seconds, mode: governance.enforcement_mode }
+  });
+  await postEnforcementRecord(guild, governance, [
+    '## 拘留',
+    `対象: ${publicMemberLabel(caseRecord.accused_id, '動作確認用アカウント')}`,
+    `期間: ${Math.round(seconds / 60)}分（<t:${Math.floor(detention.ends_at / 1000)}:R>まで）`,
+    '罰ではなく、裁判所の審理を確保するための保全です。拘留中も自分の事件記録では反論できます。',
+    governance.enforcement_mode === 'live' ? null : '（記録のみ・実際の制限はかけていません）'
+  ].filter(Boolean).join('\n'));
+  return detention;
+}
+
+export async function releaseCaseDetention(guild, caseId) {
+  const detention = getCaseDetention(caseId);
+  if (!detention || detention.status !== 'active') return null;
+  const released = releaseDetention(caseId);
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'system',
+    action: 'detention.released',
+    targetType: 'case',
+    targetId: caseId,
+    detail: { userId: detention.user_id, detainedSeconds: detainedSeconds(caseId) }
+  });
+  return released;
+}
+
+async function continuePoliceSanction(guild, caseRecord, sanction, procedure) {
+  const courtFirst = procedure.courtFirstSanctions.includes(sanction.type);
+  if (courtFirst) {
     if (caseRecord.status === 'defense' || caseRecord.public_thread_id) return caseRecord;
+    // 追放・参加禁止は警察が実行できない。裁判所へ送り、その審理の間だけ拘留する。
     let current = updateCase(caseRecord.id, { status: 'filing', review_count: 1 });
     current = await finishCaseFiling(guild, current);
-    await postCourtUpdate(guild, current, `${sanction.type}は裁判前に実行しません。本人の回答を待ち、<t:${Math.floor(current.defense_until / 1000)}:F>までに判定します。`, { state: '答弁' });
+    await detainForCourt(guild, current, procedure);
+    await postCourtUpdate(guild, current, `${sanctionLabel(sanction)}は警察が実行できません。裁判所が審理し、本人の回答を待って<t:${Math.floor(current.defense_until / 1000)}:F>までに判定します。`, { state: '答弁' });
     return current;
   }
   if (sanction.status === 'reviewable') {
     return updateCase(caseRecord.id, sanction.type === 'warning'
       ? { status: 'final', finalized_at: caseRecord.finalized_at ?? Date.now() }
-      : { status: 'summary_active' });
+      : { status: 'contest_window' });
   }
   if (sanction.required_approvals > 0) {
     if (caseRecord.status === 'approval') return caseRecord;
@@ -1769,7 +690,7 @@ async function continueSummarySanction(guild, caseRecord, sanction, procedure) {
     return getCase(caseRecord.id);
   }
   if (caseRecord.status !== 'execution') {
-    if (!sanction.notice_delivered) await notifySummarySanction(guild, caseRecord, sanction);
+    if (!sanction.notice_delivered) await notifyPoliceSanction(guild, caseRecord, sanction);
     queueExecution(caseRecord, getSanction(sanction.id));
   }
   await processGovernanceOutbox(guild.client);
@@ -1788,11 +709,11 @@ export async function ensurePublicCaseRecord(guild, caseRecord) {
   return current;
 }
 
-async function finishSummaryReview(guild, caseRecord) {
+async function finishPoliceReview(guild, caseRecord) {
   requireGovernance(guild.id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution?.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   if (!procedure) return finishCaseFiling(guild, caseRecord);
   let current = getCase(caseRecord.id);
   const law = getLaw(current.law_id);
@@ -1800,7 +721,7 @@ async function finishSummaryReview(guild, caseRecord) {
   const offense = law.provisions.offenses?.find((entry) => entry.code === current.offense_code);
   if (!offense) throw new Error('犯罪構成要件が法律にありません。');
   const existingSanction = getCaseSanction(current.id);
-  if (existingSanction) return continueSummarySanction(guild, current, existingSanction, procedure);
+  if (existingSanction) return continuePoliceSanction(guild, current, existingSanction, procedure);
   const evidence = listCaseEvidence(current.id);
   const panel = await runJudicialPanel({
     guildId: guild.id,
@@ -1810,13 +731,13 @@ async function finishSummaryReview(guild, caseRecord) {
     evidence,
     submissions: [],
     policy,
-    phase: 'summary'
+    phase: 'police'
   });
   current = updateCase(current.id, {
     panel_id: panel.panelId,
-    verdict: { phase: 'summary', verdict: panel.verdict, sanction: panel.sanction, panelId: panel.panelId }
+    verdict: { phase: 'police', verdict: panel.verdict, sanction: panel.sanction, panelId: panel.panelId }
   });
-  const summaryAudit = [
+  const policeAudit = [
     `対象: ${publicMemberLabel(current.accused_id, '動作確認用アカウント')}`,
     `申立内容: ${current.summary}`,
     ...publicLawDetails(law, current.offense_code),
@@ -1829,22 +750,19 @@ async function finishSummaryReview(guild, caseRecord) {
     }, null, 2),
     '```'
   ].join('\n');
+  const { governance } = requireGovernance(guild.id);
   if (panel.verdict !== 'responsible' || !panel.sanction) {
     current = updateCase(current.id, { status: 'acquitted', finalized_at: Date.now() });
-    current = await ensurePublicCaseRecord(guild, current);
-    await postCourtUpdate(guild, current, '成立法の必要票に達しなかったため、処分せず終了しました。', {
-      state: '責任なし',
-      files: [{ attachment: Buffer.from(summaryAudit), name: '判断詳細.md' }]
-    });
+    await postEnforcementRecord(guild, governance, [
+      '## 不受理',
+      `対象: ${publicMemberLabel(current.accused_id, '動作確認用アカウント')}`,
+      ...publicLawDetails(law, current.offense_code),
+      '成立法の必要票に達しなかったため、処分せず終えました。'
+    ].join('\n'), { files: [{ attachment: Buffer.from(policeAudit), name: '警察の判断.md' }] });
     return current;
   }
   const profile = profileForSanction(law, panel.sanction, policy);
-  const trialFirst = procedure.trialFirstSanctions.includes(panel.sanction.type);
-  current = await ensurePublicCaseRecord(guild, current);
-  await postCourtUpdate(guild, current, `成立法に照らした${procedure.panelSeats}席中${procedure.votesRequired}席以上の判断により、${panel.sanction.type}を選びました。`, {
-    state: '判断中',
-    files: [{ attachment: Buffer.from(summaryAudit), name: '判断詳細.md' }]
-  });
+  const trialFirst = procedure.courtFirstSanctions.includes(panel.sanction.type);
   const sanction = createSanction({
     caseId: current.id,
     guildId: guild.id,
@@ -1858,19 +776,19 @@ async function finishSummaryReview(guild, caseRecord) {
     appealable: isAppealable(panel.sanction, policy),
     restrictionStartedAt: trialFirst ? null : Date.now()
   });
-  return continueSummarySanction(guild, current, sanction, procedure);
+  return continuePoliceSanction(guild, current, sanction, procedure);
 }
 
 async function finishCaseFiling(guild, caseRecord) {
   const { governance } = requireGovernance(guild.id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   let current = getCase(caseRecord.id);
   const thread = await createCourtCaseThread(guild, governance, current, {
     onPartial: (patch) => { current = updateCase(current.id, patch); }
   });
-  const defenseUntil = Date.now() + (procedure?.trialMilliseconds ?? policy.judiciary.defenseMilliseconds);
+  const defenseUntil = Date.now() + (procedure?.contestMilliseconds ?? policy.judiciary.defenseMilliseconds);
   current = updateCase(current.id, {
     status: 'defense',
     public_thread_id: thread.publicThreadId,
@@ -1883,87 +801,7 @@ async function finishCaseFiling(guild, caseRecord) {
   await ensureEvidenceDisclosures(guild, current);
   await postCourtUpdate(guild, current, `答弁期限: <t:${Math.floor(defenseUntil / 1000)}:F>`, { state: '答弁' });
   await notifyCaseParty(guild, current, 'defense', defenseUntil);
-  if (!procedure) await applyInterimProtectionFromLogs(guild, current);
   return current;
-}
-
-export async function applyInterimProtectionFromLogs(guild, caseRecord, now = Date.now()) {
-  const { governance } = requireGovernance(guild.id);
-  const current = getCase(caseRecord.id);
-  if (!current || current.guild_id !== guild.id || current.kind !== 'criminal' || current.status !== 'defense') return null;
-  const existing = getCaseInterimProtection(current.id);
-  if (existing) return existing;
-  const law = getLaw(current.law_id);
-  if (!law || law.guild_id !== guild.id || law.status !== 'active') return null;
-  const offense = law.provisions.offenses?.find((entry) => entry.code === current.offense_code);
-  const definition = offense?.interimProtection;
-  if (!validateInterimProtectionDefinition(definition)) return null;
-  if (governance.enforcement_mode === 'live') {
-    const member = guild.members?.fetch
-      ? await guild.members.fetch(current.accused_id).catch(() => null)
-      : null;
-    if (!member || member.id === guild.ownerId || member.permissions?.has?.(PermissionFlagsBits.Administrator)) return null;
-  }
-
-  const evidence = listCaseEvidence(current.id).find((entry) => (
-    entry.author_id === current.accused_id && entry.message_id && entry.channel_id && entry.occurred_at
-  ));
-  if (!evidence) return null;
-  const trigger = definition.trigger;
-  const occurredAt = Number(evidence.occurred_at);
-  const windowMs = trigger.windowSeconds * 1000;
-  // 過去ログだけで現在の発言権を奪わない。申立て時点でも同じburst window内にある場合だけ評価する。
-  if (occurredAt > now + 30_000 || now - occurredAt > windowMs) return null;
-  const messages = recentUserActivity(
-    guild.id,
-    current.accused_id,
-    evidence.channel_id,
-    occurredAt - windowMs,
-    occurredAt,
-    100
-  );
-  if (!messages.some((message) => message.message_id === evidence.message_id)
-    || messages.length < trigger.minimumMessages) return null;
-
-  const status = governance.enforcement_mode === 'live' ? 'active' : 'simulated';
-  const protection = createInterimProtection({
-    caseId: current.id,
-    guildId: guild.id,
-    userId: current.accused_id,
-    lawId: law.id,
-    offenseCode: offense.code,
-    triggerType: trigger.type,
-    minimumEvents: trigger.minimumMessages,
-    observedEvents: messages.length,
-    windowSeconds: trigger.windowSeconds,
-    durationSeconds: definition.durationSeconds,
-    evidenceMessageId: evidence.message_id,
-    evidenceChannelId: evidence.channel_id,
-    startedAt: now,
-    endsAt: now + definition.durationSeconds * 1000,
-    status
-  });
-  writeAudit({
-    guildId: guild.id,
-    actorType: 'system',
-    action: status === 'active' ? 'interim_protection.started' : 'interim_protection.simulated',
-    targetType: 'interim_protection',
-    targetId: protection.id,
-    detail: {
-      caseId: current.id,
-      lawId: law.id,
-      offenseCode: offense.code,
-      evidenceMessageId: evidence.message_id,
-      observedEvents: messages.length,
-      minimumEvents: trigger.minimumMessages,
-      windowSeconds: trigger.windowSeconds,
-      durationSeconds: definition.durationSeconds
-    }
-  });
-  await postCourtUpdate(guild, current, status === 'active'
-    ? `一時保全を開始しました。直近${trigger.windowSeconds}秒の公開ログ${messages.length}件を確認し、<t:${Math.floor(protection.ends_at / 1000)}:T>まで被申立人の投稿先をこの事件に限ります。これは判決や刑罰ではなく、自動終了します。`
-    : `一時保全の条件をshadowで確認しました。直近${trigger.windowSeconds}秒の公開ログ${messages.length}件が基準${trigger.minimumMessages}件を満たしましたが、実際の発言制限は行っていません。`);
-  return protection;
 }
 
 export async function addEvidenceToCase(guild, member, caseId, evidence) {
@@ -2069,7 +907,7 @@ export async function fileConstitutionalChallenge(guild, reporter, input) {
     status: 'filing',
     defenseUntil: null,
     constitutionId: constitution.id,
-    procedureVersion: summaryProcedure(policy) ? 2 : 1,
+    procedureVersion: policeProcedure(policy) ? 2 : 1,
     reporterType: input.official ? 'ai' : 'member'
   });
   addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, content: input.reason, occurredAt: Date.now() });
@@ -2194,7 +1032,7 @@ export async function recordCourtSubmissionEdit(message) {
 
 async function beginAppealWindow(guild, caseRecord, sanction) {
   const policy = constitutionForCase(caseRecord).policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   const now = Date.now();
   sanction = updateSanction(sanction.id, {
     status: 'pending_appeal',
@@ -2207,6 +1045,11 @@ async function beginAppealWindow(guild, caseRecord, sanction) {
 }
 
 function queueExecution(caseRecord, sanction) {
+  // 拘留していた時間は刑期から差し引く。第十条4。
+  const detained = detainedSeconds(caseRecord.id);
+  if (detained > 0 && sanction.duration_seconds && !sanction.restriction_started_at) {
+    updateSanction(sanction.id, { restriction_started_at: Date.now() - detained * 1000 });
+  }
   updateSanction(sanction.id, { status: 'queued' });
   updateCase(caseRecord.id, { status: 'execution' });
   enqueueAction({
@@ -2242,7 +1085,7 @@ async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
   const governance = getGovernanceGuild(guild.id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   const currentLaw = getLaw(caseRecord.law_id);
   if (!currentLaw || currentLaw.status !== 'active') throw new Error('適用法が現在有効ではありません。');
   const evidence = listCaseEvidence(caseRecord.id);
@@ -2475,9 +1318,11 @@ async function adjudicateConstitutionalCase(guild, caseRecord) {
     ? '再審査後も合憲必要票に達しなかったため、対象の執行を停止しました。'
     : `違憲 ${unconstitutional}/${constitution.policy.judiciary.panelSeats}で対象を取り消しました。`, { state: '取消' });
   if (caseRecord.challenged_type === 'law') {
-    await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
-      console.error(`Failed to update law ${target.id} in statute book:`, error);
-    });
+    try {
+      syncLawSite(guild);
+    } catch (error) {
+      console.error(`Failed to queue law ${target.id} for the public law site:`, error);
+    }
   }
 }
 
@@ -2567,7 +1412,7 @@ export async function approveCase(interaction, caseId, decision) {
     `${publicMemberLabel(member.id)} が執行を${decision === 'approve' ? '承認' : '拒否'}しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。承認 ${approvals}/${sanction.required_approvals}`
   );
   if (decision === 'approve' && approvals >= sanction.required_approvals) {
-    const procedure = summaryProcedure(policy);
+    const procedure = policeProcedure(policy);
     const appealWindowAlreadyOffered = Boolean(procedure && sanction.appeal_deadline);
     if (sanction.appealable && !getAppeal(caseId) && !appealWindowAlreadyOffered) {
       await beginAppealWindow(interaction.guild, caseRecord, sanction);
@@ -2589,7 +1434,7 @@ export async function appealCase(guild, member, caseId, grounds) {
   const now = Date.now();
   const submissionsUntil = now + policy.judiciary.defenseMilliseconds;
   updateCase(caseId, { status: 'appeal', retry_after: submissionsUntil, last_error: null });
-  if (!summaryProcedure(policy)) updateSanction(sanction.id, { restriction_started_at: now });
+  if (!policeProcedure(policy)) updateSanction(sanction.id, { restriction_started_at: now });
   enqueueAction({
     guildId: guild.id,
     actionType: 'appeal_restrict',
@@ -2603,14 +1448,14 @@ export async function appealCase(guild, member, caseId, grounds) {
   return getCase(caseId);
 }
 
-export async function requestSummaryTrial(guild, member, sanctionId) {
+export async function requestTrial(guild, member, sanctionId) {
   const sanction = getSanction(sanctionId);
   if (!sanction || sanction.guild_id !== guild.id) throw new Error('処分が見つかりません。');
   if (sanction.user_id !== member.id) throw new Error('処分を受けた本人だけが裁判を求められます。');
   const caseRecord = getCase(sanction.case_id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution?.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   if (!procedure || caseRecord.procedure_version !== 2) throw new Error('この処分は簡易裁判の対象ではありません。');
   if (Number(caseRecord.review_count ?? 0) !== 0 || sanction.review_requested_at) {
     throw new Error('この処分の裁判請求は既に使われています。');
@@ -2628,7 +1473,7 @@ export async function requestSummaryTrial(guild, member, sanctionId) {
     status: 'filing',
     review_count: 1,
     response_completed_at: null,
-    decision_due_at: now + procedure.trialMilliseconds
+    decision_due_at: now + procedure.contestMilliseconds
   });
   if (sanction.type === 'timeout') {
     enqueueAction({
@@ -2647,10 +1492,50 @@ export async function requestSummaryTrial(guild, member, sanctionId) {
   return current;
 }
 
+// 不服申立ては判決が出るまでいつでも取り下げられる。取り下げた時点で処分が確定する。
+export async function withdrawContest(guild, member, caseId) {
+  const caseRecord = getCase(caseId);
+  if (!caseRecord || caseRecord.guild_id !== guild.id) throw new Error('事件が見つかりません。');
+  if (caseRecord.accused_id !== member.id) throw new Error('申立てた本人だけが取り下げられます。');
+  if (!['defense', 'appeal'].includes(caseRecord.status)) throw new Error('いま取り下げられる申立てはありません。');
+  const sanction = getCaseSanction(caseId);
+  if (!sanction) throw new Error('対象の処分がありません。');
+  const appealing = caseRecord.status === 'appeal';
+  await releaseCaseDetention(guild, caseId);
+  if (appealing) updateAppeal(caseId, { status: 'withdrawn', decided_at: Date.now() });
+  const current = updateCase(caseId, { response_completed_at: Date.now(), retry_after: null, last_error: null });
+  await postCourtUpdate(guild, current, `${publicMemberLabel(member.id)} が${appealing ? '上訴' : '審理の請求'}を取り下げました。処分をそのまま確定します。`, {
+    state: '確定'
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'member',
+    actorId: member.id,
+    action: appealing ? 'appeal.withdrawn' : 'contest.withdrawn',
+    targetType: 'case',
+    targetId: caseId,
+    detail: { sanctionId: sanction.id }
+  });
+  // 既に始まっている即時処分は、取り下げでそのまま確定する。まだ執行していない
+  // 送検事件だけを執行へ回す。
+  const applied = ['reviewable', 'executed', 'simulated'].includes(sanction.status);
+  if (applied) {
+    const { governance } = requireGovernance(guild.id);
+    updateSanction(sanction.id, {
+      status: governance.enforcement_mode === 'live' ? 'executed' : 'simulated'
+    });
+    updateCase(caseId, { status: 'final', finalized_at: Date.now() });
+  } else {
+    queueExecution(getCase(caseId), getSanction(sanction.id));
+    await processGovernanceOutbox(guild.client);
+  }
+  return getCase(caseId);
+}
+
 export async function detectAutomaticEnforcement(message) {
   if (!message?.guildId || message.author?.bot) return null;
   const { constitution } = requireGovernance(message.guildId);
-  const procedure = summaryProcedure(constitution.policy);
+  const procedure = policeProcedure(constitution.policy);
   if (!procedure || !publicChannel(message, getGovernanceGuild(message.guildId))) return null;
   for (const law of listLaws(message.guildId).filter((entry) => entry.status === 'active')) {
     if (Number(message.createdTimestamp) < Number(law.effective_at)) continue;
@@ -2667,11 +1552,11 @@ export async function detectAutomaticEnforcement(message) {
         100
       );
       if (recent.length < trigger.minimumMessages) continue;
-      if (findRecentSummaryCase(message.guildId, message.author.id, law.id, offense.code, message.createdTimestamp - windowMs)) continue;
+      if (findRecentPoliceCase(message.guildId, message.author.id, law.id, offense.code, message.createdTimestamp - windowMs)) continue;
       const triggerEvidence = recent.slice(-trigger.minimumMessages);
       const first = triggerEvidence[0];
       const eventKey = `auto:${law.id}:${offense.code}:${message.author.id}:${message.channelId}:${first.message_id}:${message.id}`;
-      if (findCaseBySummaryEvent(message.guildId, eventKey)) continue;
+      if (findCaseByPoliceEvent(message.guildId, eventKey)) continue;
       const reporter = { id: message.guild?.client?.user?.id ?? 'system' };
       return fileCriminalCase(message.guild, reporter, {
         accused: message.member ?? { id: message.author.id },
@@ -2686,7 +1571,7 @@ export async function detectAutomaticEnforcement(message) {
           occurredAt: entry.created_at
         })),
         attemptReserved: true,
-        summaryEventKey: eventKey
+        policeEventKey: eventKey
       });
     }
   }
@@ -2750,66 +1635,20 @@ async function ensureAppealRestriction(guild, sanctionId) {
   }
 }
 
+// 議題を進めるのは国会だけ。schedulerが自分で進めるのは投票の締切だけになった。
 export async function advanceProposal(guild, proposal, now) {
-  if (proposal.workflow_status === 'queued') return proposal;
   if (proposal.retry_after && proposal.retry_after > now) return proposal;
   const runtime = proposalRuntime(proposal);
-  if (!runtime || runtime.state.handler === 'terminal') return proposal;
-  if (runtime.state.handler === 'draft') return draftStoredProposal(guild, proposal);
-  if (runtime.state.handler === 'public_discussion') {
-    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) {
-      if (!quietClosableProposal(proposal, runtime, now)) return proposal;
-      // 誰も来ないまま無風期間を過ぎた討議は、締切まで待たずに締める。
-      return completeProposalDebate(guild, updateProposal(proposal.id, { stage_ends_at: now }), now, { quietClose: true });
-    }
-    if (['initial', 'revision'].includes(runtime.state.config.phase)) {
-      return completeProposalDebate(guild, proposal, now);
-    }
-    if (runtime.state.config.phase === 'legacy_draft') {
-      const transition = proposalTransition(proposal, 'expired');
-      const reviewing = updateProposal(proposal.id, {
-        status: transition.targetName,
-        stage_started_at: now,
-        stage_ends_at: proposalStageEnd(transition, now)
-      });
-      return constitutionalReviewProposal(guild, reviewing);
-    }
-    if (runtime.state.config.phase === 'legacy_debate') return openProposalVote(guild, proposal);
-    throw new Error(`未対応の公開討議phaseです: ${runtime.state.config.phase ?? '(none)'}`);
+  if (!runtime || runtime.state.handler !== 'public_vote') return proposal;
+  if (proposal.stage_ends_at !== null && Number(proposal.stage_ends_at) <= now) {
+    return closeProposalVote(guild, proposal);
   }
-  if (runtime.state.handler === 'ai_deliberation') return completeProposalDebate(guild, proposal, now);
-  if (runtime.state.handler === 'objection_window') {
-    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) return proposal;
-    return closeProposalObjections(guild, proposal, now);
-  }
-  if (runtime.state.handler === 'council_decision') return councilDecideProposal(guild, proposal);
-  if (runtime.state.handler === 'enactment_hold') {
-    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) return proposal;
-    return closeEnactmentHold(guild, proposal, now);
-  }
-  if (runtime.state.handler === 'constitutional_panel') return constitutionalReviewProposal(guild, proposal);
-  if (runtime.state.handler === 'public_vote') {
-    if (proposal.stage_ends_at !== null && Number(proposal.stage_ends_at) <= now) {
-      return closeProposalVote(guild, proposal);
-    }
-    if (allBallotsCast(proposal, runtime)) {
-      // 受付時に固定した有権者が全員投票したので、残り時間で結果は動かない。
-      await postProposalUpdate(guild, proposal, '受付時の有権者が全員投票したため、締切を待たずに開票します。', { state: '投票' });
-      return closeProposalVote(guild, proposal);
-    }
+  if (allBallotsCast(proposal, runtime)) {
+    // 受付時に固定した有権者が全員投票したので、残り時間で結果は動かない。
+    await postProposalUpdate(guild, proposal, '受付時の有権者が全員投票したため、締切を待たずに開票します。', { state: '投票' });
+    return closeProposalVote(guild, proposal);
   }
   return proposal;
-}
-
-function quietClosableProposal(proposal, runtime, now) {
-  if (!['initial', 'revision'].includes(runtime.state.config.phase)) return false;
-  const quietClose = runtime.state.config.quietClose;
-  if (typeof quietClose !== 'string') return false;
-  const quiet = durationMilliseconds(quietClose);
-  if (quiet <= 0) return false;
-  const startedAt = Number(proposal.stage_started_at ?? proposal.created_at);
-  if (!Number.isFinite(startedAt) || now - startedAt < quiet) return false;
-  return proposalDiscussion(proposal.id, startedAt, now, 1).length === 0;
 }
 
 function allBallotsCast(proposal, runtime) {
@@ -2821,129 +1660,6 @@ function allBallotsCast(proposal, runtime) {
   const electorate = Number(summary.electorate);
   if (!Number.isFinite(electorate) || electorate <= 0) return false;
   return summary.yes + summary.no + summary.abstain >= electorate;
-}
-
-async function queueProposalBehind(guild, proposal, blocker, reason) {
-  const queued = queueProposalWorkflow(proposal.id, {
-    blockedByProposalId: blocker.id,
-    reason
-  });
-  if (queued.forum_thread_id) {
-    await postProposalUpdate(
-      guild,
-      queued,
-      `先に受理された「${blocker.title}」と同じ対象を更新するため、審議を一時停止しました。先行案件の終了後、最新版を基礎に自動で再開します。`,
-      { state: '待機', components: [] }
-    );
-  }
-  return queued;
-}
-
-export async function reconcileProposalQueues(guild) {
-  const newlyQueued = [];
-  let proposals = listProposals(guild.id, { limit: 500 });
-  const activeAmendments = proposals
-    .filter((proposal) => proposal.kind === 'amendment' && activeProposal(proposal))
-    .sort((left, right) => Number(left.id) - Number(right.id));
-  const firstAmendment = activeAmendments[0] ?? null;
-  for (const proposal of activeAmendments.slice(1)) {
-    newlyQueued.push(await queueProposalBehind(guild, proposal, firstAmendment, 'constitution_in_progress'));
-  }
-
-  proposals = listProposals(guild.id, { limit: 500 });
-  const laws = listLaws(guild.id, { activeOnly: false, limit: 500 });
-  const lawsById = new Map(laws.map((law) => [String(law.id), law]));
-  const firstByRoot = new Map();
-  for (const proposal of proposals
-    .filter((entry) => entry.kind === 'law' && entry.target_type === 'law' && activeProposal(entry))
-    .sort((left, right) => Number(left.id) - Number(right.id))) {
-    const law = lawsById.get(String(proposal.target_id));
-    const root = String(law?.root_law_id ?? law?.id ?? proposal.target_id);
-    const first = firstByRoot.get(root);
-    if (!first) firstByRoot.set(root, proposal);
-    else newlyQueued.push(await queueProposalBehind(guild, proposal, first, 'same_law_in_progress'));
-  }
-  return newlyQueued;
-}
-
-async function resumeQueuedProposalAndDraft(guild, proposal) {
-  const constitution = getActiveConstitution(guild.id);
-  const relatedInputs = Array.isArray(proposal.workflow_context?.queue?.inputs)
-    ? proposal.workflow_context.queue.inputs
-    : [];
-  let targetType = null;
-  let targetId = null;
-  let targetHash = null;
-  if (proposal.kind === 'amendment') {
-    targetType = 'constitution';
-    targetId = constitution.id;
-    targetHash = constitution.content_hash;
-  } else if (proposal.target_type === 'law') {
-    const law = getCurrentLawVersion(proposal.target_id);
-    if (!law || law.guild_id !== guild.id || law.status !== 'active') {
-      const remanded = updateProposal(proposal.id, { status: 'remanded', stage_ends_at: Date.now() });
-      if (remanded.forum_thread_id) {
-        await postProposalUpdate(guild, remanded, '改正対象の法律が現行ではなくなったため、審議待ちを終了して差し戻しました。', { state: '廃案' });
-      }
-      return remanded;
-    }
-    targetType = 'law';
-    targetId = law.id;
-    targetHash = law.content_hash;
-  }
-  let resumed = resumeQueuedProposal(proposal.id, {
-    constitutionId: constitution.id,
-    targetType,
-    targetId,
-    targetHash
-  });
-  if (resumed.forum_thread_id) {
-    await postProposalUpdate(guild, resumed, '先行案件が終了したため、最新版を基礎に草案を作り直します。', { state: '草案', components: [] });
-  }
-  try {
-    resumed = await draftStoredProposal(guild, resumed, { relatedInputs });
-  } catch (error) {
-    updateProposal(resumed.id, retryPatch(resumed, error));
-    throw error;
-  }
-  if (resumed.forum_thread_id) {
-    await postProposalUpdate(
-      guild,
-      resumed,
-      '審議待ちを終了し、最新版を基礎に討議を開始しました。',
-      { files: proposalBodyFiles(resumed.kind, resumed.body, '再起草案') }
-    );
-  }
-  return resumed;
-}
-
-export async function resumeProposalQueues(guild) {
-  const proposals = listProposals(guild.id, { limit: 500 });
-  const active = proposals.filter(activeProposal);
-  const queued = proposals
-    .filter((proposal) => proposal.workflow_status === 'queued')
-    .sort((left, right) => Number(left.id) - Number(right.id));
-  const resumed = [];
-  if (!active.some((proposal) => proposal.kind === 'amendment')) {
-    const next = queued.find((proposal) => proposal.kind === 'amendment');
-    if (next) resumed.push(await resumeQueuedProposalAndDraft(guild, next));
-  }
-  const laws = listLaws(guild.id, { activeOnly: false, limit: 500 });
-  const rootOf = (lawId) => {
-    const law = laws.find((entry) => String(entry.id) === String(lawId));
-    return String(law?.root_law_id ?? law?.id ?? lawId);
-  };
-  const activeRoots = new Set(active
-    .filter((proposal) => proposal.kind === 'law' && proposal.target_type === 'law')
-    .map((proposal) => rootOf(proposal.target_id)));
-  const resumedRoots = new Set();
-  for (const proposal of queued.filter((entry) => entry.kind === 'law' && entry.target_type === 'law')) {
-    const root = rootOf(proposal.target_id);
-    if (activeRoots.has(root) || resumedRoots.has(root)) continue;
-    resumed.push(await resumeQueuedProposalAndDraft(guild, proposal));
-    resumedRoots.add(root);
-  }
-  return resumed;
 }
 
 async function syncRetriedIntake(guild, resultType, result) {
@@ -2958,13 +1674,13 @@ async function syncRetriedIntake(guild, resultType, result) {
 
 async function advanceCase(guild, caseRecord, now) {
   if (caseRecord.retry_after && caseRecord.retry_after > now) return;
-  if (caseRecord.status === 'summary_review') {
-    await finishSummaryReview(guild, caseRecord);
+  if (caseRecord.status === 'police_review') {
+    await finishPoliceReview(guild, caseRecord);
     return;
   }
   if (caseRecord.status === 'filing') {
-    if (caseRecord.procedure_version === 2 && caseRecord.summary_event_key && !getCaseSanction(caseRecord.id)) {
-      await finishSummaryReview(guild, caseRecord);
+    if (caseRecord.procedure_version === 2 && caseRecord.police_event_key && !getCaseSanction(caseRecord.id)) {
+      await finishPoliceReview(guild, caseRecord);
     } else {
       await finishCaseFiling(guild, caseRecord);
     }
@@ -3011,270 +1727,6 @@ async function advanceCase(guild, caseRecord, now) {
   }
 }
 
-/**
- * 定期国会。実行規則の周期で開き、溜まった意見とAIの発見を議題にして、
- * 起草・停止中の法律の再審まで1回の開会でまとめる。成立judgeは案件ごとの
- * 手続に任せ、ここでは議題を作ることと会議録を残すことだけを行う。
- */
-export async function runParliamentSession(guild, governance, now) {
-  if (!getOperationalSetting(guild.id, 'weekly_scan_enabled')) return;
-  if (governance.last_weekly_scan_at && now - governance.last_weekly_scan_at < 7 * DAY_MS) return;
-  if (governance.weekly_retry_after && governance.weekly_retry_after > now) return;
-  const constitution = getActiveConstitution(guild.id);
-  const council = constitution.rules?.panels?.council ?? null;
-  const limit = Math.max(0, Math.min(10, getOperationalSetting(guild.id, 'weekly_draft_limit')));
-  const opinions = council ? listParliamentOpinions(guild.id, { status: 'pending', limit: 50 }) : [];
-  const suspended = council
-    ? listLaws(guild.id, { activeOnly: false, limit: 200 }).filter((law) => law.status === 'suspended')
-    : [];
-  const issues = limit > 0
-    ? await discoverParliamentIssues(guild, governance, constitution, limit, now)
-    : [];
-  if (opinions.length === 0 && suspended.length === 0 && issues.length === 0) {
-    updateGovernanceGuild(guild.id, {
-      last_weekly_scan_at: now,
-      weekly_retry_after: null,
-      weekly_failure_count: 0,
-      weekly_last_error: null
-    });
-    return;
-  }
-  const session = createParliamentSession(guild.id, { openedAt: now });
-  updateGovernanceGuild(guild.id, {
-    last_weekly_scan_at: now,
-    weekly_retry_after: null,
-    weekly_failure_count: 0,
-    weekly_last_error: null
-  });
-  const record = { openedAt: now, opinions: [], issues: [], suspended: [], filed: [] };
-
-  // 1. 意見の採否。席ごとの判断を必要票で畳み、落ちた意見にも理由を残す。
-  if (opinions.length > 0) {
-    const { outputs } = await screenParliamentOpinions({
-      guildId: guild.id,
-      opinions,
-      constitution,
-      activeLaws: listLaws(guild.id),
-      seats: council.seats
-    });
-    for (const [index, opinion] of opinions.entries()) {
-      const assessments = outputs.map((output) => output.assessments[index]).filter(Boolean);
-      const adopt = assessments.filter((entry) => entry.adopt).length;
-      const adopted = adopt >= council.required.adopt;
-      const reasons = assessments.map((entry) => entry.reason);
-      settleParliamentOpinion(opinion.id, {
-        status: adopted ? 'adopted' : 'rejected',
-        sessionId: session.id,
-        decision: { adopt, required: council.required.adopt, seats: council.seats, reasons }
-      });
-      record.opinions.push({
-        id: opinion.id, title: opinion.title, kind: opinion.kind, adopted, adopt, reasons
-      });
-      if (!adopted) continue;
-      const filed = await fileParliamentAgendaItem(guild, constitution, {
-        kind: opinion.kind,
-        title: opinion.title,
-        summary: opinion.summary,
-        source: `opinion:${opinion.id}`
-      });
-      if (filed) record.filed.push(filed);
-    }
-  }
-
-  // 2. AIが公開ログから見つけた問題。
-  for (const issue of issues) {
-    record.issues.push({ title: issue.title });
-    const filed = await fileParliamentAgendaItem(guild, constitution, {
-      kind: 'petition',
-      title: issue.title,
-      summary: issue.summary,
-      source: 'weekly'
-    });
-    if (filed) record.filed.push(filed);
-  }
-
-  // 3. 停止中の法律を維持するか廃止するか。
-  for (const law of suspended) {
-    try {
-      const suspensions = listLawSuspensions(law.id);
-      const { outputs } = await reviewSuspendedLaw({
-        guildId: guild.id,
-        law,
-        reasons: suspensions.map((entry) => entry.reason),
-        constitution,
-        seats: council.seats
-      });
-      const keep = outputs.filter((output) => output.verdict === 'keep').length;
-      const kept = keep >= council.required.enact;
-      updateLaw(law.id, kept ? { status: 'active' } : { status: 'repealed', ended_at: Date.now() });
-      record.suspended.push({
-        lawId: law.id, title: law.title, kept, keep, required: council.required.enact,
-        reasons: outputs.flatMap((output) => output.reasons).slice(0, 10)
-      });
-    } catch (error) {
-      console.error(`Failed to review suspended law ${law.id}:`, error);
-    }
-  }
-
-  await publishParliamentRecord(guild, governance, session, record).catch((error) => {
-    console.error(`Failed to publish parliament record ${session.id}:`, error);
-  });
-  await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
-    console.error('Failed to publish statute book after parliament session:', error);
-  });
-}
-
-async function discoverParliamentIssues(guild, governance, constitution, limit, now) {
-  const since = now - 7 * DAY_MS;
-  await guild.channels.fetch();
-  const publicIds = new Set([...guild.channels.cache.values()]
-    .filter((channel) => channel.isTextBased?.()
-      && !governanceSurface(channel, governance)
-      && channel.permissionsFor(guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel))
-    .map((channel) => channel.id));
-  if (publicIds.size === 0) return [];
-  const messages = recentGovernanceMessages(guild.id, since, [...publicIds], 300)
-    .map((row) => ({
-      id: row.message_id,
-      channelId: row.channel_id,
-      content: row.content.slice(0, 500),
-      createdAt: row.created_at
-    }));
-  if (messages.length === 0) return [];
-  const issues = await discoverWeeklyIssues({
-    guildId: guild.id, constitution, activeLaws: listLaws(guild.id), messages, limit
-  });
-  const sourceById = new Map(messages.map((message) => [String(message.id), message]));
-  return issues.map((issue) => {
-    const links = issue.evidenceMessageIds
-      .map((id) => sourceById.get(String(id)))
-      .filter(Boolean)
-      .map((message, index) => `[根拠投稿 ${index + 1}](https://discord.com/channels/${guild.id}/${message.channelId}/${message.id})`);
-    return {
-      title: issue.title,
-      summary: links.length > 0 ? `${issue.summary}\n\n国会が検出した根拠:\n${links.join('\n')}` : issue.summary
-    };
-  });
-}
-
-/**
- * 議題を案件にする。現行法で済んでいる、進行中の案件と同じ、という判定は
- * 既存の類似案件panelに任せ、新規に立てるものだけを起草へ回す。
- */
-async function fileParliamentAgendaItem(guild, constitution, { kind, title, summary, source }) {
-  const official = { id: guild.client.user.id };
-  try {
-    const proposals = listProposals(guild.id, { limit: 100 });
-    const normalized = { intent: kind === 'amendment' ? 'amendment' : 'petition', title, summary, question: null };
-    const exact = exactActiveProposalMatch(title, proposals);
-    const candidates = buildLegislativeCandidates({
-      request: { title, summary, source },
-      normalized,
-      proposals,
-      laws: listLaws(guild.id, { activeOnly: false, limit: 100 }),
-      constitution
-    });
-    const reviewed = exact ? {
-      relation: 'join_active', targetType: 'proposal', targetId: String(exact.id),
-      reasons: ['同じ題名の案件がすでに進行中です。'], materialDifferences: [], outputs: []
-    } : await reviewLegislativeRelation({
-      guildId: guild.id,
-      request: { title, summary, source },
-      normalized,
-      candidates,
-      panel: constitution.rules?.panels?.proposalRelation
-    });
-    const target = reviewed.targetType && reviewed.targetId
-      ? candidates.find((entry) => entry.type === reviewed.targetType && String(entry.id) === String(reviewed.targetId))
-      : null;
-    const relation = {
-      ...reviewed,
-      targetHash: target?.contentHash ?? null,
-      targetVersion: target?.version ?? null,
-      targetTitle: target?.title ?? null
-    };
-    const sourceId = sha256(`${source}:${title}:${summary}`);
-    if (['covered', 'uncertain'].includes(relation.relation)) {
-      if (relation.relation !== 'uncertain') recordInstrumentRelation({
-        guildId: guild.id,
-        sourceType: 'parliament_agenda',
-        sourceId,
-        relationType: relation.relation,
-        targetType: relation.targetType ?? 'none',
-        targetId: relation.targetId ?? 'none',
-        targetHash: relation.targetHash,
-        reasons: relation.reasons,
-        decision: relation
-      });
-      return { title, outcome: relation.relation, reasons: relation.reasons };
-    }
-    if (relation.relation === 'join_active') {
-      const targetProposal = getProposal(relation.targetId);
-      if (targetProposal?.forum_thread_id) {
-        await postProposalUpdate(guild, targetProposal, `国会が関連する論点を議題に加えました。\n${summary}`);
-        recordInstrumentRelation({
-          guildId: guild.id,
-          sourceType: 'parliament_agenda',
-          sourceId,
-          relationType: relation.relation,
-          targetType: 'proposal',
-          targetId: targetProposal.id,
-          reasons: relation.reasons,
-          decision: relation
-        });
-      }
-      return { title, outcome: 'join_active', proposalId: targetProposal?.id ?? null };
-    }
-    const amendment = relation.relation === 'amend_constitution' || kind === 'amendment';
-    const proposal = amendment
-      ? await fileAmendment(guild, official, { title, summary, source, relation })
-      : await filePetition(guild, official, {
-        title: relation.relation === 'amend_law' ? `${target.title}の改正`.slice(0, 50) : title,
-        summary: relation.relation === 'amend_law'
-          ? `現行の「${target.title}」を次の内容で改正する。${summary}`.slice(0, 1800)
-          : summary,
-        source,
-        relation
-      });
-    return { title: proposal.title, outcome: 'filed', proposalId: proposal.id };
-  } catch (error) {
-    // 案件はdraftingで永続化済み。残りの議題を落とさず、次回のschedulerへ任せる。
-    console.error(`Failed to file parliament agenda item ${title}:`, error);
-    return { title, outcome: 'failed' };
-  }
-}
-
-async function publishParliamentRecord(guild, governance, session, record) {
-  const lines = [
-    `# 国会 第${session.id}回`,
-    '',
-    `意見 ${record.opinions.length}件 / 検出 ${record.issues.length}件 / 起草 ${record.filed.filter((entry) => entry.outcome === 'filed').length}件 / 停止中の再審 ${record.suspended.length}件`
-  ];
-  if (record.opinions.length) {
-    lines.push('', '## 意見の採否');
-    for (const opinion of record.opinions) {
-      lines.push(`- ${opinion.adopted ? '採用' : '棄却'} (${opinion.adopt}席): ${opinion.title}`);
-      if (!opinion.adopted && opinion.reasons[0]) lines.push(`  - ${opinion.reasons[0]}`);
-    }
-  }
-  if (record.issues.length) {
-    lines.push('', '## 国会が見つけた問題');
-    for (const issue of record.issues) lines.push(`- ${issue.title}`);
-  }
-  if (record.suspended.length) {
-    lines.push('', '## 停止中の法律');
-    for (const entry of record.suspended) {
-      lines.push(`- ${entry.kept ? '維持' : '廃止'} (維持 ${entry.keep}/${entry.required}席): ${entry.title}`);
-    }
-  }
-  const { threadId } = await createParliamentRecordThread(guild, governance, {
-    name: `国会 第${session.id}回`,
-    content: lines.join('\n'),
-    files: [{ attachment: Buffer.from(`${JSON.stringify(record, null, 2)}\n`), name: '会議録.json' }]
-  });
-  closeParliamentSession(session.id, record, threadId);
-}
-
 let schedulerRunning = false;
 let lastPruneAt = 0;
 const verifiedStatuteGuilds = new Set();
@@ -3282,7 +1734,7 @@ const verifiedRecordUiGuilds = new Set();
 const verifiedIntakeUiGuilds = new Set();
 
 function finalizeElapsedSummarySanctions(guildId, now) {
-  for (const caseRecord of listCases(guildId, { statuses: ['summary_active'], limit: 100 })) {
+  for (const caseRecord of listCases(guildId, { statuses: ['contest_window'], limit: 100 })) {
     const sanction = getCaseSanction(caseRecord.id);
     if (!sanction) continue;
     const elapsed = sanction.type === 'warning'
@@ -3304,7 +1756,7 @@ export async function runGovernanceScheduler(client) {
       lastPruneAt = now;
     }
     expireRestrictions(now);
-    const expiredProtections = expireInterimProtections(now);
+    const expiredDetentions = expireDetentions(now);
     const expiredIntakes = expireGovernanceIntakes(now);
     if (expiredIntakes.length > 0) {
       const { updateExpiredIntakeMessages } = await import('./intake.js');
@@ -3316,46 +1768,30 @@ export async function runGovernanceScheduler(client) {
       const guild = client.guilds.cache.get(governance.guild_id) ?? await client.guilds.fetch(governance.guild_id).catch(() => null);
       if (!guild) continue;
       finalizeElapsedSummarySanctions(guild.id, now);
-      for (const protection of expiredProtections.filter((entry) => entry.guild_id === guild.id)) {
-        const caseRecord = getCase(protection.case_id);
-        if (caseRecord?.public_thread_id) {
-          await postCourtUpdate(guild, caseRecord, '一時保全は期限どおり自動終了しました。被申立人の発言状態は通常に戻っています。')
-            .catch((error) => console.error(`Failed to publish interim protection expiry ${protection.id}:`, error));
-        }
+      for (const detention of expiredDetentions.filter((entry) => entry.guild_id === guild.id)) {
         writeAudit({
           guildId: guild.id,
           actorType: 'system',
-          action: 'interim_protection.expired',
-          targetType: 'interim_protection',
-          targetId: protection.id,
-          detail: { caseId: protection.case_id, endedAt: now }
+          action: 'detention.expired',
+          targetType: 'case',
+          targetId: detention.case_id,
+          detail: { userId: detention.user_id, endedAt: now }
         });
       }
       let currentGovernance = governance;
       try {
         const roles = await ensureGovernanceMentionRoles(guild, currentGovernance);
-        if (roles.legislatureRoleId !== governance.legislature_role_id
-          || roles.judiciaryRoleId !== governance.judiciary_role_id) {
-          currentGovernance = updateGovernanceGuild(guild.id, {
-            legislature_role_id: roles.legislatureRoleId,
-            judiciary_role_id: roles.judiciaryRoleId
-          });
+        if (roles.judiciaryRoleId !== governance.judiciary_role_id) {
+          currentGovernance = updateGovernanceGuild(guild.id, { judiciary_role_id: roles.judiciaryRoleId });
         }
       } catch (error) {
         console.error(`Failed to ensure governance mention roles in ${guild.id}:`, error);
       }
       try {
-        const statuteForum = await ensureGovernanceStatuteForum(guild, currentGovernance);
-        const statuteForumChanged = statuteForum.id !== currentGovernance.statute_forum_id;
-        if (statuteForumChanged) {
-          currentGovernance = updateGovernanceGuild(guild.id, { statute_forum_id: statuteForum.id });
-        }
-        await syncStatuteBook(guild, currentGovernance, {
-          verifyExisting: statuteForumChanged || !verifiedStatuteGuilds.has(guild.id)
-        });
+        syncLawSite(guild, { verifyExisting: !verifiedStatuteGuilds.has(guild.id) });
         verifiedStatuteGuilds.add(guild.id);
       } catch (error) {
-        console.error(`Failed to sync statute book in ${guild.id}:`, error);
+        console.error(`Failed to sync the public law site in ${guild.id}:`, error);
       }
       try {
         await ensureGovernanceParliamentForum(guild, currentGovernance);
@@ -3385,42 +1821,21 @@ export async function runGovernanceScheduler(client) {
       } catch (error) {
         console.error(`Failed to resume mention investigations in ${guild.id}:`, error);
       }
-      let queueUiChanged = false;
-      try {
-        queueUiChanged = (await reconcileProposalQueues(guild)).length > 0;
-      } catch (error) {
-        console.error(`Failed to reconcile proposal queues in ${guild.id}:`, error);
-      }
       for (const proposal of listProposals(guild.id, { limit: 100 })
-        .filter((entry) => entry.workflow_status !== 'queued'
-          && proposalRuntime(entry)?.state?.handler !== 'terminal')) {
+        .filter((entry) => proposalRuntime(entry)?.state?.handler === 'public_vote')) {
         try {
-          const current = await advanceProposal(guild, proposal, now) ?? getProposal(proposal.id);
-          if (current?.status !== 'drafting') await syncRetriedIntake(guild, 'proposal', current);
+          await advanceProposal(guild, proposal, now);
         } catch (error) {
           updateProposal(proposal.id, retryPatch(getProposal(proposal.id), error));
           console.error(`Failed to advance proposal ${proposal.id}:`, error);
         }
       }
-      try {
-        queueUiChanged = (await resumeProposalQueues(guild)).length > 0 || queueUiChanged;
-      } catch (error) {
-        console.error(`Failed to resume proposal queue in ${guild.id}:`, error);
-      }
-      if (queueUiChanged) {
-        try {
-          const { ensureGovernanceUx } = await import('./ux.js');
-          currentGovernance = (await ensureGovernanceUx(guild, currentGovernance)).governance;
-        } catch (error) {
-          console.error(`Failed to publish proposal queue state in ${guild.id}:`, error);
-        }
-      }
-      const cases = listCases(guild.id, { statuses: ['filing', 'summary_review', 'defense', 'deliberation', 'appeal_window', 'appeal'], limit: 100 });
+      const cases = listCases(guild.id, { statuses: ['filing', 'police_review', 'defense', 'deliberation', 'appeal_window', 'appeal'], limit: 100 });
       for (const caseRecord of cases) {
         try {
           await advanceCase(guild, caseRecord, now);
           const current = getCase(caseRecord.id);
-          if (current && !current.retry_after && !['filing', 'summary_review'].includes(current.status)) {
+          if (current && !current.retry_after && !['filing', 'police_review'].includes(current.status)) {
             await syncRetriedIntake(guild, 'case', current);
           }
         } catch (error) {
@@ -3429,16 +1844,17 @@ export async function runGovernanceScheduler(client) {
         }
       }
       try {
-        await runParliamentSession(guild, currentGovernance, now);
-      } catch (error) {
-        const current = getGovernanceGuild(guild.id);
-        const failures = Number(current.weekly_failure_count ?? 0) + 1;
-        updateGovernanceGuild(guild.id, {
-          weekly_failure_count: failures,
-          weekly_retry_after: now + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.min(failures - 1, 4))),
-          weekly_last_error: String(error?.message ?? error).slice(0, 500)
+        const { runParliamentSession, recordParliamentFailure } = await import('./parliament.js');
+        const session = await runParliamentSession(guild, currentGovernance, now).catch((error) => {
+          recordParliamentFailure(guild, getGovernanceGuild(guild.id), error, now);
+          throw error;
         });
-        console.error(`Weekly governance review failed in ${guild.id}:`, error);
+        if (session) {
+          const { ensureGovernanceUx } = await import('./ux.js');
+          currentGovernance = (await ensureGovernanceUx(guild, getGovernanceGuild(guild.id))).governance;
+        }
+      } catch (error) {
+        console.error(`Parliament session failed in ${guild.id}:`, error);
       }
     }
     await processGovernanceOutbox(client);
@@ -3471,6 +1887,12 @@ export async function processGovernanceOutbox(client) {
   for (const action of pendingActions(25)) {
     markActionRunning(action.id);
     try {
+      // 法令の公開はDiscordを一切触らないので、guildやsanctionの解決より前に処理する。
+      if (action.action_type === 'law_publish') {
+        await publishInstrument(action.guild_id, action.payload);
+        completeAction(action.id);
+        continue;
+      }
       const governance = getGovernanceGuild(action.guild_id);
       const guild = client.guilds.cache.get(action.guild_id) ?? await client.guilds.fetch(action.guild_id);
       const sanction = getSanction(action.payload.sanctionId);
@@ -3565,7 +1987,7 @@ export async function processGovernanceOutbox(client) {
         updateCase(sanction.case_id, reviewable
           ? (sanction.type === 'warning'
             ? { status: 'final', finalized_at: Date.now() }
-            : { status: 'summary_active' })
+            : { status: 'contest_window' })
           : { status: 'final', finalized_at: Date.now() });
         createAdministrativeAct({
           guildId: guild.id,
@@ -3582,16 +2004,23 @@ export async function processGovernanceOutbox(client) {
           }
         });
         const executionLabel = governance.enforcement_mode === 'live' ? '実執行' : '記録のみ';
-        let publicCase = await ensurePublicCaseRecord(guild, getCase(sanction.case_id));
-        publicCase = getCase(publicCase.id);
-        await postCourtUpdate(
-          guild,
-          publicCase,
-          reviewable
-            ? `即時処分を${executionLabel}として記録しました。本人は裁判を求められます。`
-            : `裁判で確定した処分を${executionLabel}として処理しました。`,
-          { state: publicCase.status }
-        );
+        const publicCase = getCase(sanction.case_id);
+        if (publicCase.public_thread_id) {
+          // 裁判所へ来た事件だけが事件投稿を持つ。警察止まりの処分は執行記録へ。
+          await postCourtUpdate(guild, publicCase, `裁判で確定した処分を${executionLabel}として処理しました。`, {
+            state: publicCase.status
+          });
+        } else {
+          await postEnforcementRecord(guild, governance, [
+            `## ${reviewable ? '即時処分' : '処分の確定'}`,
+            `対象: ${publicMemberLabel(publicCase.accused_id, '動作確認用アカウント')}`,
+            `処分: ${sanctionLabel(getSanction(sanction.id))}`,
+            `理由: ${publicCase.summary}`,
+            `${executionLabel}として記録しました。${reviewable ? '本人は期限内に裁判所の審理を求められます。' : ''}`
+          ].join('\n'), {
+            components: reviewable ? contestButtons(guild.id, sanction.id) : []
+          });
+        }
       } else if (action.action_type === 'sanction_reverse') {
         const execution = parseExecutionDetail(sanction.execution_detail);
         await reverseDiscordSanction(guild, governance, sanction, {
@@ -3670,7 +2099,6 @@ export async function onGuildRoleDelete(role) {
     await postAuthorityChange(role.guild, governance, '特別有権者機能を自動無効化', '設定されていたロールが削除されたため、拒否権と重い処分の承認を無効化しました。');
   }
   const patch = {};
-  if (governance.legislature_role_id === role.id) patch.legislature_role_id = '';
   if (governance.judiciary_role_id === role.id) patch.judiciary_role_id = '';
   if (Object.keys(patch).length > 0) {
     updateGovernanceGuild(role.guild.id, patch);
